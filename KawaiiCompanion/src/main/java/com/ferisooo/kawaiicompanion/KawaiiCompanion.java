@@ -517,6 +517,11 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
         int stuckTicks;
         /** Earliest tick we're allowed to kick off another A* search. Throttles main-thread cost. */
         long nextRepathAllowedTick;
+        /** While {@code tick < combatGiveUpUntil} she ignores combat targets and
+         *  returns to the owner. Set when she's been stuck in water chasing a
+         *  target she can't reach (walled off), so she stops drowning at the
+         *  barrier instead of bobbing there forever. */
+        long combatGiveUpUntil;
         /** Last position we sampled for stuck-detection. */
         double lastStuckSampleX, lastStuckSampleY, lastStuckSampleZ;
 
@@ -3273,6 +3278,12 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
      *  cached target is re-validated cheaply, so the costly getNearbyEntities
      *  sweep runs at ~1 Hz instead of every tick. */
     private static final long FORM_TARGET_SCAN_INTERVAL = 10;
+    /** Stuck-in-water ticks while chasing a combat target before she gives up on
+     *  it (~3 s at the 10 Hz behavior rate). */
+    private static final int  COMBAT_WATER_GIVEUP_TICKS = 30;
+    /** How long she ignores combat targets after a water give-up, so she actually
+     *  gets back to dry land before re-engaging (~6 s). */
+    private static final long COMBAT_WATER_GIVEUP_COOLDOWN = 60;
     /** Treat companion as "stuck" after this many movement ticks under {@link #STUCK_MIN_MOVE_SQ}. */
     private static final int STUCK_TICK_THRESHOLD = 6;
     /** Less than ~0.15 block of horizontal motion per tick = stuck. */
@@ -3385,6 +3396,21 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
                 && tick >= c.nextRepathAllowedTick
                 && preStep.distance(target) > stopDist + 1.0) {
             tryRepath(c, preStep, target, tick);
+        }
+
+        // Combat give-up: if she's been stuck in water while chasing a combat
+        // target (approachingEntity), she's almost certainly walled off and
+        // just drowning at the barrier — destructive escape is disabled in
+        // combat and tryCombatClimb can only lift her straight up, neither of
+        // which clears a wall. Drop the target for a few seconds and let her
+        // walk back to the owner (onto dry land) instead of bobbing forever.
+        if (c.approachingEntity
+                && c.stuckTicks >= COMBAT_WATER_GIVEUP_TICKS
+                && w != null
+                && w.getBlockAt(preStep.getBlockX(), preStep.getBlockY(), preStep.getBlockZ())
+                        .getType() == Material.WATER) {
+            c.combatGiveUpUntil = tick + COMBAT_WATER_GIVEUP_COOLDOWN;
+            c.stuckTicks = 0;
         }
 
         // Escalation — if normal repathing hasn't freed her in a while,
@@ -5146,6 +5172,9 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
      */
     private boolean engageKillTargets(Companion c, long tick, Player owner) {
         if (c.entity == null || c.entity.isDead()) return false;
+        // Stand down briefly after giving up a target she was stuck in water
+        // trying to reach, so she gets back to dry land before re-engaging.
+        if (tick < c.combatGiveUpUntil) return false;
         // Persistent hunt: keep topping up the list with new matching mobs.
         if (!c.huntFilter.isEmpty()) refillHuntTargets(c, owner);
         if (c.killTargets.isEmpty()) return false;
@@ -5368,6 +5397,9 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
      * Returns true if any threat handling happened this tick.
      */
     private boolean engageThreatsNear(Companion c, Location origin, long tick, Player owner) {
+        // Recently gave up a target she was drowning trying to reach — stand
+        // down from combat briefly so she returns to the owner / dry land.
+        if (tick < c.combatGiveUpUntil) return false;
         // Use the wider bow range if she's currently in bow mode so she
         // doesn't disengage the second the phantom drifts past 16 blocks.
         double scanRange = (autoEquipBowVsFlying && c.bowEquipped) ? bowDetectionRange : guardRadius;
