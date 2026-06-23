@@ -162,9 +162,11 @@ form-combat:
   # Seconds between attacks. Style multipliers apply on top (warden
   # sonic boom is much slower, llama spit faster, etc).
   attack-period-seconds: 2
-  # Damage per hit in hearts, plus a bonus per companion level.
+  # Damage per hit in hearts. This is a FIXED value — her attacks do NOT get
+  # stronger as she levels up.
   damage-hearts: 2.0
-  damage-per-level-hearts: 0.25
+  # (removed) damage-per-level-hearts no longer does anything — attack damage
+  # is flat and never scales with level. Leaving the key here has no effect.
 
 # ===== Leveling & abilities (FEATURE 2) =======================
 #

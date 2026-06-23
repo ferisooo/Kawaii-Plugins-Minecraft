@@ -364,9 +364,8 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
     private double  formCombatRange;
     /** Base ticks between attacks (style multipliers apply on top). */
     private long    formAttackPeriodTicks;
-    /** Damage per hit in HP (hearts × 2), plus per-level bonus. */
+    /** Damage per form-combat hit in HP (hearts × 2). Fixed — never scales with level. */
     private double  formDamageBase;
-    private double  formDamagePerLevel;
     /** All living, spawnable Mob types offered as forms (cached at enable). */
     private List<String> mobForms = List.of();
 
@@ -1021,7 +1020,9 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
         formAttackPeriodTicks = Math.max(5, cfg.getLong("form-combat.attack-period-seconds", 2) * 20L
                 / Math.max(1, movementTickPeriod));
         formDamageBase        = Math.max(0.5, cfg.getDouble("form-combat.damage-hearts", 2.0)) * 2.0;
-        formDamagePerLevel    = Math.max(0.0, cfg.getDouble("form-combat.damage-per-level-hearts", 0.25)) * 2.0;
+        // Attack damage is intentionally flat — it does NOT scale with level, so
+        // she never gets "stronger and stronger". The old
+        // form-combat.damage-per-level-hearts knob is ignored if still in config.
         mobForms              = allMobForms();
     }
 
@@ -6169,9 +6170,8 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
                 if (dmg > 0) base = dmg;
             }
         }
-        // Visible leveling: every level past 1 adds half a heart of punch, so
-        // higher-level Kohaku noticeably kills faster.
-        base += 0.5 * Math.max(0, c.level - 1);
+        // Attack damage is fixed — it does NOT scale with level, so she never
+        // hits harder as she levels up. Damage comes purely from her weapon.
         return base;
     }
 
@@ -7451,9 +7451,10 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
         };
     }
 
-    /** Damage per form-combat hit (HP), scaling with companion level. */
+    /** Damage per form-combat hit (HP). Fixed — does NOT scale with level, so
+     *  her attacks never grow stronger as she levels up. */
     private double formDamage(Companion c) {
-        return formDamageBase + Math.max(0, c.level - 1) * formDamagePerLevel;
+        return formDamageBase;
     }
 
     /** True if this entity UUID is some player's live mob-form companion. */
