@@ -22,6 +22,7 @@ import org.bukkit.event.entity.CreatureSpawnEvent;
 import org.bukkit.event.entity.EntityCombustByBlockEvent;
 import org.bukkit.event.entity.EntityCombustByEntityEvent;
 import org.bukkit.event.entity.EntityCombustEvent;
+import org.bukkit.event.entity.EntityDeathEvent;
 import org.bukkit.event.player.PlayerBedEnterEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.jetbrains.annotations.NotNull;
@@ -35,6 +36,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
@@ -85,6 +87,9 @@ public final class KawaiiNights extends JavaPlugin implements Listener {
     private final List<EntityType> raidMobs = new ArrayList<>();
     private final Map<String, NightState> nights = new HashMap<>();
     private NamespacedKey raidTagKey;
+
+    /** UUIDs of currently-living raid-spawned mobs, so we needn't scan all world entities. */
+    private final Set<UUID> raidMobIds = new HashSet<>();
 
     /** Per-world night bookkeeping: night/raid state + pending raids for the night. */
     private static final class NightState {
@@ -225,13 +230,14 @@ public final class KawaiiNights extends JavaPlugin implements Listener {
 
     /** True if no living raid-tagged mobs remain in the world. */
     private boolean raidMobsCleared(World w) {
-        for (Entity e : w.getEntities()) {
-            if (e instanceof Monster && e.isValid()
-                    && e.getPersistentDataContainer().has(raidTagKey, PersistentDataType.BYTE)) {
-                return false;
-            }
+        boolean cleared = true;
+        Iterator<UUID> it = raidMobIds.iterator();
+        while (it.hasNext()) {
+            Entity e = Bukkit.getEntity(it.next());
+            if (e == null || !e.isValid()) { it.remove(); continue; } // dead/removed — prune
+            if (e.getWorld() == w) cleared = false;
         }
-        return true;
+        return cleared;
     }
 
     /** True if a raid is currently raging in this world (so sleep is blocked). */
@@ -288,6 +294,7 @@ public final class KawaiiNights extends JavaPlugin implements Listener {
             Entity m = trySpawn(victim, type, raidMinRadius, raidMaxRadius, raidIgnoreLight, true);
             if (m == null) continue;
             m.getPersistentDataContainer().set(raidTagKey, PersistentDataType.BYTE, (byte) 1);
+            raidMobIds.add(m.getUniqueId()); // track so we don't have to scan all world entities
             if (m instanceof Mob mob) {
                 try { mob.setTarget(victim); } catch (Throwable ignored) {}
             }
@@ -411,6 +418,12 @@ public final class KawaiiNights extends JavaPlugin implements Listener {
         if (e.getEntity() instanceof Monster) e.setCancelled(true);
     }
 
+    /** Drop dead raid mobs from the tracked set so it stays small and accurate. */
+    @EventHandler
+    public void onEntityDeath(EntityDeathEvent e) {
+        if (!raidMobIds.isEmpty()) raidMobIds.remove(e.getEntity().getUniqueId());
+    }
+
     /** Most recent server TPS (defaults to 20 if the API is unavailable). */
     private static double recentTps() {
         try {
@@ -426,8 +439,8 @@ public final class KawaiiNights extends JavaPlugin implements Listener {
         int removed = 0;
         for (World w : Bukkit.getWorlds()) {
             if (!applies(w)) continue;
-            for (Entity e : w.getEntities()) {
-                if (e instanceof Monster && !BOSSES.contains(e.getType()) && !e.isPersistent()) {
+            for (Monster e : w.getEntitiesByClass(Monster.class)) {
+                if (!BOSSES.contains(e.getType()) && !e.isPersistent()) {
                     e.remove();
                     removed++;
                 }

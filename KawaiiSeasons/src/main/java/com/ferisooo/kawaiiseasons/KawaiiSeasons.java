@@ -18,6 +18,7 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockGrowEvent;
 import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.potion.PotionEffect;
@@ -27,9 +28,12 @@ import org.jetbrains.annotations.NotNull;
 import java.io.File;
 import java.io.IOException;
 import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
@@ -77,6 +81,15 @@ public final class KawaiiSeasons extends JavaPlugin implements Listener {
     private final Set<String> enabledWorlds = new HashSet<>();
     private final Set<String> forcedStormWorlds = new HashSet<>();
 
+    /** Tracks which season weather we last applied so we only touch it on changes. */
+    private Season lastWeatherSeason;
+
+    /**
+     * Last block column (packed X/Z) we ran the snow scan for, per player. Lets us
+     * skip the scan entirely while a player stands still in the same column.
+     */
+    private final Map<UUID, Long> lastSnowColumn = new HashMap<>();
+
     /** Surfaces snow is allowed to settle on, so it never coats player builds. */
     private static final Set<Material> NATURAL_GROUND = EnumSet.of(
             Material.GRASS_BLOCK, Material.DIRT, Material.COARSE_DIRT, Material.ROOTED_DIRT,
@@ -108,6 +121,8 @@ public final class KawaiiSeasons extends JavaPlugin implements Listener {
             if (w != null) w.setStorm(false);
         }
         forcedStormWorlds.clear();
+        lastSnowColumn.clear();
+        lastWeatherSeason = null;
     }
 
     private void readConfig() {
@@ -207,16 +222,23 @@ public final class KawaiiSeasons extends JavaPlugin implements Listener {
 
     private void manageWeather(Season season) {
         if (!forceWeather) return;
+        // Only (re)apply weather when the season actually changes, not every cycle.
+        // We still re-arm a winter storm that vanilla let expire, but that's a cheap
+        // hasStorm() check rather than unconditional setStorm/setWeatherDuration churn.
+        boolean seasonChanged = season != lastWeatherSeason;
+        lastWeatherSeason = season;
+
         if (season == Season.WINTER) {
+            // Use a long storm duration so vanilla rarely clears it between changes.
             for (World w : Bukkit.getWorlds()) {
                 if (!applies(w)) continue;
-                if (!w.hasStorm()) {
+                if (seasonChanged || !w.hasStorm()) {
                     w.setStorm(true);
-                    w.setWeatherDuration(20 * 60 * 10); // 10 min; re-applied each tick anyway
+                    w.setWeatherDuration(20 * 60 * 60); // 1h; refreshed only on (re)apply
                 }
                 forcedStormWorlds.add(w.getName());
             }
-        } else if (!forcedStormWorlds.isEmpty()) {
+        } else if (seasonChanged && !forcedStormWorlds.isEmpty()) {
             for (String name : forcedStormWorlds) {
                 World w = Bukkit.getWorld(name);
                 if (w != null) w.setStorm(false);
@@ -258,9 +280,18 @@ public final class KawaiiSeasons extends JavaPlugin implements Listener {
         World w = p.getWorld();
         int px = p.getLocation().getBlockX();
         int pz = p.getLocation().getBlockZ();
+
+        // Movement gate: if the player hasn't moved to a new block column since the
+        // last cycle, the surrounding ground is already snowed — skip the scan.
+        long column = (((long) px) << 32) ^ (pz & 0xFFFFFFFFL);
+        Long previous = lastSnowColumn.put(p.getUniqueId(), column);
+        if (previous != null && previous == column) return;
+
         for (int dx = -snowRadius; dx <= snowRadius; dx++) {
             for (int dz = -snowRadius; dz <= snowRadius; dz++) {
                 int x = px + dx, z = pz + dz;
+                // Never force a chunk to load just to snow it.
+                if (!w.isChunkLoaded(x >> 4, z >> 4)) continue;
                 int y = w.getHighestBlockYAt(x, z);
                 Block top = w.getBlockAt(x, y, z);
                 Material tm = top.getType();
@@ -322,6 +353,14 @@ public final class KawaiiSeasons extends JavaPlugin implements Listener {
     @EventHandler
     public void onWorldChange(PlayerChangedWorldEvent e) {
         updateSeasonPdc(e.getPlayer());
+        // Crossing worlds means a fresh column context; drop the cached one.
+        lastSnowColumn.remove(e.getPlayer().getUniqueId());
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent e) {
+        // Avoid leaking the per-player snow-column cache after disconnect.
+        lastSnowColumn.remove(e.getPlayer().getUniqueId());
     }
 
     private void updateAllSeasonPdc() {
@@ -359,6 +398,9 @@ public final class KawaiiSeasons extends JavaPlugin implements Listener {
         if (args.length >= 1 && args[0].equalsIgnoreCase("reload")) {
             if (!sender.hasPermission("kawaiiseasons.admin")) { sender.sendMessage("§c(✧) no permission~"); return true; }
             readConfig();
+            // Force weather + snow scan to re-evaluate once after a config change.
+            lastWeatherSeason = null;
+            lastSnowColumn.clear();
             sender.sendMessage("§d(✧) KawaiiSeasons reloaded ✨");
             return true;
         }

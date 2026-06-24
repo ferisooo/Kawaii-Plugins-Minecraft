@@ -2,9 +2,10 @@ package com.ferisooo.kawaiithirst;
 
 import org.bukkit.Bukkit;
 import org.bukkit.GameMode;
-import org.bukkit.Keyed;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
+import org.bukkit.Registry;
+import org.bukkit.block.Biome;
 import org.bukkit.boss.BarColor;
 import org.bukkit.boss.BarStyle;
 import org.bukkit.boss.BossBar;
@@ -68,6 +69,7 @@ public final class KawaiiThirst extends JavaPlugin implements Listener {
     private double dehydrationDamage;
 
     private final Set<String> hotBiomes = new HashSet<>();
+    private final Set<Biome> hotBiomeSet = new HashSet<>();
     private final Set<Material> juicyFoods = new HashSet<>();
 
     @Override
@@ -93,7 +95,7 @@ public final class KawaiiThirst extends JavaPlugin implements Listener {
         enabled            = c.getBoolean("enabled", true);
         showBar            = c.getBoolean("show-bar", true);
         max                = Math.max(1.0, c.getDouble("max-thirst", 20));
-        intervalTicks      = Math.max(5L, c.getLong("update-ticks", 60));
+        intervalTicks      = Math.max(20L, c.getLong("update-ticks", 60));
         drainPerInterval   = Math.max(0.0, c.getDouble("drain-per-update", 0.6));
         sprintMultiplier   = Math.max(1.0, c.getDouble("sprint-multiplier", 2.0));
         hotMultiplier      = Math.max(1.0, c.getDouble("hot-biome-multiplier", 1.8));
@@ -109,6 +111,16 @@ public final class KawaiiThirst extends JavaPlugin implements Listener {
         if (hotBiomes.isEmpty()) {
             for (String s : new String[]{"desert", "savanna", "badlands", "mesa",
                     "nether", "basalt", "crimson", "warped", "soul_sand"}) hotBiomes.add(s);
+        }
+        // Resolve the configured keyword substrings against the biome registry
+        // once on (re)load, so the per-tick hot-biome check is a single Set
+        // lookup instead of a substring scan over every keyword.
+        hotBiomeSet.clear();
+        for (Biome b : Registry.BIOME) {
+            String k = b.getKey().getKey().toLowerCase(Locale.ROOT);
+            for (String s : hotBiomes) {
+                if (k.contains(s)) { hotBiomeSet.add(b); break; }
+            }
         }
 
         juicyFoods.clear();
@@ -269,10 +281,9 @@ public final class KawaiiThirst extends JavaPlugin implements Listener {
     // ----------------------------------------------------------------- helpers
 
     private boolean isHot(Player p) {
-        Keyed biome = p.getLocation().getBlock().getBiome();
-        String k = biome.getKey().getKey().toLowerCase(Locale.ROOT);
-        for (String s : hotBiomes) if (k.contains(s)) return true;
-        return false;
+        var loc = p.getLocation();
+        Biome biome = p.getWorld().getBiome(loc.getBlockX(), loc.getBlockY(), loc.getBlockZ());
+        return hotBiomeSet.contains(biome);
     }
 
     private BossBar ensureBar(Player p) {
@@ -299,6 +310,12 @@ public final class KawaiiThirst extends JavaPlugin implements Listener {
     }
 
     private void setThirst(Player p, double v) {
-        p.getPersistentDataContainer().set(key, PersistentDataType.DOUBLE, v);
+        // Skip the write when the stored value is already identical — the tick
+        // loop calls this every interval per player, and the value is often
+        // unchanged (e.g. already full, or standing still at the cap).
+        PersistentDataContainer pdc = p.getPersistentDataContainer();
+        Double cur = pdc.get(key, PersistentDataType.DOUBLE);
+        if (cur != null && cur == v) return;
+        pdc.set(key, PersistentDataType.DOUBLE, v);
     }
 }

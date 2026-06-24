@@ -24,19 +24,18 @@ public final class FiveHearts extends JavaPlugin implements Listener {
 
         for (Player p : getServer().getOnlinePlayers()) applyLimits(p);
 
-        // Clamp task: runs twice per second to enforce hard caps
+        // Single per-second sweep that does both jobs in one getOnlinePlayers()
+        // loop: enforce the hard caps (clamp) and drive custom health regen.
+        // The clamp is also covered by the event handlers (onFoodChange /
+        // onConsume / onJoin / onRespawn); this periodic pass is just a safety
+        // net, so once-per-second is plenty — no need for a second full sweep.
+        // Regen is gated on food being at the cap, so its cadence is unchanged.
         new BukkitRunnable() {
             @Override public void run() {
-                for (Player p : getServer().getOnlinePlayers()) applyLimits(p);
-            }
-        }.runTaskTimer(this, 10L, 10L);
-
-        // Custom health regeneration (once per second). Food is capped at
-        // 10 (below vanilla's regen threshold of 18), so natural regen never
-        // fires — we drive it ourselves instead.
-        new BukkitRunnable() {
-            @Override public void run() {
-                for (Player p : getServer().getOnlinePlayers()) regenerate(p);
+                for (Player p : getServer().getOnlinePlayers()) {
+                    applyLimits(p);
+                    regenerate(p);
+                }
             }
         }.runTaskTimer(this, 20L, 20L); // 20 ticks = 1 second
 

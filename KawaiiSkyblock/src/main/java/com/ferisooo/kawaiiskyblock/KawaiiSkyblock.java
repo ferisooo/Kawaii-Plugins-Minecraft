@@ -84,6 +84,14 @@ public final class KawaiiSkyblock extends JavaPlugin implements Listener {
     };
     private int guiFrame = 0;
 
+    // Round-robin cursor for recomputeAllLevels: at most one island is scanned per
+    // timer tick to avoid a single multi-second main-thread stall.
+    private int recomputeCursor = 0;
+
+    // Last computed value breakdown per island owner, so the Value GUI can serve a
+    // cached result on click instead of running a fresh full block scan inline.
+    private final Map<UUID, ValueBreakdown> valueBreakdownCache = new HashMap<>();
+
     // Main menu slots — laid out symmetrically in the 45-grid interior (rows 1-3:
     // 10-16, 19-25, 28-34). Row 1: five primary actions centred (11-15). Row 2:
     // five feature buttons centred (20-24). Row 3: four feature buttons in two
@@ -104,6 +112,9 @@ public final class KawaiiSkyblock extends JavaPlugin implements Listener {
         getServer().getPluginManager().registerEvents(this, this);
         getServer().getPluginManager().registerEvents(new IslandListeners(this, islands), this);
         Bukkit.getScheduler().runTaskTimer(this, this::animateMenus, 4L, 4L);
+        // Debounced islands.yml flush: write dirty data every 30s (off-thread inside)
+        // instead of a synchronous full-file write on every single mutation.
+        Bukkit.getScheduler().runTaskTimer(this, islands::flush, 600L, 600L);
         // Periodic island-level recompute (throttled inside).
         long period = Math.max(1L, getConfig().getLong("leaderboard.recompute-minutes", 5L)) * 60L * 20L;
         Bukkit.getScheduler().runTaskTimer(this, this::recomputeAllLevels, period, period);
@@ -117,7 +128,8 @@ public final class KawaiiSkyblock extends JavaPlugin implements Listener {
 
     @Override
     public void onDisable() {
-        if (islands != null) islands.save();
+        // Always flush dirty data synchronously on shutdown so nothing is lost.
+        if (islands != null) islands.saveNow();
     }
 
     private void readConfig() {
@@ -803,6 +815,8 @@ public final class KawaiiSkyblock extends JavaPlugin implements Listener {
         long total = 0L;
         for (int x = cx - radius; x <= cx + radius; x++) {
             for (int z = cz - radius; z <= cz + radius; z++) {
+                // Never force-load chunks: skip columns whose chunk isn't loaded.
+                if (!w.isChunkLoaded(x >> 4, z >> 4)) continue;
                 for (int y = minY; y <= maxY; y++) {
                     Block b = w.getBlockAt(x, y, z);
                     Material m = b.getType();
@@ -842,6 +856,8 @@ public final class KawaiiSkyblock extends JavaPlugin implements Listener {
         int cx = center.getBlockX(), cz = center.getBlockZ();
         for (int x = cx - radius; x <= cx + radius; x++) {
             for (int z = cz - radius; z <= cz + radius; z++) {
+                // Never force-load chunks: skip columns whose chunk isn't loaded.
+                if (!w.isChunkLoaded(x >> 4, z >> 4)) continue;
                 for (int y = minY; y <= maxY; y++) {
                     Material m = w.getBlockAt(x, y, z).getType();
                     if (m == Material.AIR) continue;
@@ -856,6 +872,7 @@ public final class KawaiiSkyblock extends JavaPlugin implements Listener {
         int level = (int) Math.min(Integer.MAX_VALUE,
                 bd.total / Math.max(1, getConfig().getInt("leaderboard.points-per-level", 100)));
         islands.setLevel(owner, level);
+        valueBreakdownCache.put(owner, bd);
         return bd;
     }
 
@@ -876,16 +893,33 @@ public final class KawaiiSkyblock extends JavaPlugin implements Listener {
         return out;
     }
 
-    /** Periodic, throttled recompute of loaded islands only. */
+    /**
+     * Periodic, throttled recompute. Processes AT MOST ONE eligible island per
+     * invocation (round-robin via {@link #recomputeCursor}) so a server with many
+     * islands spreads the cost across successive timer ticks instead of stalling
+     * the main thread scanning every island back-to-back in a single tick. All
+     * islands still get recomputed over successive runs.
+     */
     private void recomputeAllLevels() {
         long throttle = Math.max(1L, getConfig().getLong("leaderboard.recompute-minutes", 5L)) * 60_000L;
         long now = System.currentTimeMillis();
-        for (UUID owner : islands.allOwners()) {
+        List<UUID> owners = islands.allOwners();
+        if (owners.isEmpty()) { recomputeCursor = 0; return; }
+        // Walk the owner list starting at the cursor, scanning the first eligible
+        // island (loaded world + throttle window elapsed), then stop for this tick.
+        int n = owners.size();
+        for (int i = 0; i < n; i++) {
+            int idx = (recomputeCursor + i) % n;
+            UUID owner = owners.get(idx);
             String folder = islands.worldFolder(owner);
             if (folder == null || Bukkit.getWorld(folder) == null) continue; // only loaded worlds
-            if (now - islands.levelComputedAt(owner) < throttle) continue;
+            if (now - islands.levelComputedAt(owner) < throttle) continue;    // still fresh
             computeLevel(owner);
+            recomputeCursor = (idx + 1) % n; // resume after this island next tick
+            return;
         }
+        // Nothing eligible this pass; nudge the cursor so it keeps rotating.
+        recomputeCursor = (recomputeCursor + 1) % n;
     }
 
     // ----------------------------------------------------------------- helpers
@@ -904,10 +938,8 @@ public final class KawaiiSkyblock extends JavaPlugin implements Listener {
     private OfflinePlayer resolvePlayer(String name) {
         Player online = Bukkit.getPlayerExact(name);
         if (online != null) return online;
-        for (OfflinePlayer op : Bukkit.getOfflinePlayers()) {
-            if (name.equalsIgnoreCase(op.getName())) return op;
-        }
-        return null;
+        // Avoid iterating every offline player ever seen; use Paper's cached lookup.
+        return Bukkit.getOfflinePlayerIfCached(name);
     }
 
     private static String name(OfflinePlayer op) {
@@ -1226,9 +1258,16 @@ public final class KawaiiSkyblock extends JavaPlugin implements Listener {
                 : islands.ownerOfWorld(p.getWorld().getName());
         if (owner == null) { p.sendMessage("§c(✧) no island here~"); return; }
 
-        // Throttle the expensive scan: reuse the cached level/breakdown window.
-        boolean fresh = !valueScanThrottled(owner);
-        ValueBreakdown bd = fresh ? computeValueBreakdown(owner) : null;
+        // Never run a fresh full block scan inline on the click — it would block the
+        // main thread for potentially seconds. Serve the last cached breakdown if we
+        // have one; otherwise schedule a scan for the next tick and show a
+        // "calculating…" state this time. The periodic timer also keeps it warm.
+        ValueBreakdown bd = valueBreakdownCache.get(owner);
+        boolean fresh = bd != null && valueScanThrottled(owner);
+        if (bd == null) {
+            // No cached breakdown yet: compute it off the click, next tick.
+            Bukkit.getScheduler().runTask(this, () -> computeValueBreakdown(owner));
+        }
         Map<Material, Integer> perBlock = blockValues();
 
         Inventory inv = newGui(GuiKind.VALUE, BIG_SIZE, "✧ Island Value ✧");
@@ -1240,16 +1279,20 @@ public final class KawaiiSkyblock extends JavaPlugin implements Listener {
         int rank = leaderboardRank(owner);
         long totalValue = bd != null ? bd.total : (long) level
                 * Math.max(1, getConfig().getInt("leaderboard.points-per-level", 100));
+        String scanState = bd == null ? "§8calculating… re-open in a moment~"
+                : (fresh ? "§8scanned recently" : "§8using cached scan");
         inv.setItem(13, button(Material.NETHER_STAR, "§d✿ " + ownerName(owner) + "'s Island ✿",
                 "§7Level: §f" + level,
                 "§7Total value: §f" + totalValue,
                 rank > 0 ? "§7Leaderboard rank: §f#" + rank : "§8(unranked)",
-                fresh ? "§8scanned just now" : "§8using cached scan"));
+                scanState));
 
-        if (bd == null || bd.subtotals.isEmpty()) {
+        if (bd == null) {
+            inv.setItem(31, button(Material.CLOCK, "§7Calculating island value…",
+                    "§8re-open in a moment for the breakdown~"));
+        } else if (bd.subtotals.isEmpty()) {
             inv.setItem(31, button(Material.BARRIER, "§7No valued blocks found",
-                    fresh ? "§8build with valuable blocks to raise your level!"
-                          : "§8re-open in a moment for a fresh scan~"));
+                    "§8build with valuable blocks to raise your level!"));
         } else {
             List<Map.Entry<Material, Long>> top = new ArrayList<>(bd.subtotals.entrySet());
             top.sort(Map.Entry.<Material, Long>comparingByValue().reversed());

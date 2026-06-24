@@ -161,6 +161,11 @@ public final class KawaiiScoreboard extends JavaPlugin implements Listener {
         // scoreboard's below-name slot — that's what shows mob health through
         // walls when a player is on the main board. Throttled to ~5s.
         if ((titleFrame & 0xFF) == 0) clearMainBelowNameHealth();
+        // Build the animated title ONCE per cycle and share it across all
+        // players: the gradient for a given frame is identical for everyone,
+        // so there's no need to recompute (allocating a Component per title
+        // character) once per player.
+        Component frameTitle = animatedTitle ? gradientTitle(titleText, titleFrame) : null;
         for (Player p : Bukkit.getOnlinePlayers()) {
             // Accrue playtime for everyone online, even if their sidebar is
             // hidden, so the per-world totals stay accurate.
@@ -181,7 +186,7 @@ public final class KawaiiScoreboard extends JavaPlugin implements Listener {
                 // Re-assert our board if something swapped the player back to
                 // the main scoreboard (which is what hid the sidebar).
                 if (p.getScoreboard() != b.scoreboard()) b.show();
-                refresh(p, b);
+                refresh(p, b, frameTitle);
             }
         }
     }
@@ -223,7 +228,11 @@ public final class KawaiiScoreboard extends JavaPlugin implements Listener {
         UUID id = p.getUniqueId();
         accrue(p, p.getWorld().getName());
         lastSample.remove(id);
-        savePlaytime();
+        // The quitting player's playtime is now captured in the in-memory map
+        // (accrue above). Persist it off the main thread instead of doing a
+        // synchronous full-map YAML write on every quit. The 60s autosave and
+        // the onDisable flush still guard against data loss.
+        savePlaytimeAsync();
         PlayerBoard b = boards.remove(id);
         if (b != null) b.detach();
         // suppressed is intentionally NOT cleared on quit — preference
@@ -285,10 +294,43 @@ public final class KawaiiScoreboard extends JavaPlugin implements Listener {
         }
     }
 
+    /** Synchronous full-map write. Used by the 60s autosave and onDisable flush. */
     private void savePlaytime() {
         if (playtimeFile == null) return;
-        FileConfiguration cfg = new YamlConfiguration();
+        writeSnapshot(snapshotPlaytime());
+    }
+
+    /**
+     * Snapshot the playtime map on the (current) main thread, then perform the
+     * file write off-thread. Used on quit so a synchronous YAML write doesn't
+     * stall the server tick on every disconnect.
+     */
+    private void savePlaytimeAsync() {
+        if (playtimeFile == null) return;
+        final Map<UUID, Map<String, Long>> snapshot = snapshotPlaytime();
+        try {
+            Bukkit.getScheduler().runTaskAsynchronously(this, () -> writeSnapshot(snapshot));
+        } catch (IllegalStateException ex) {
+            // Scheduler refuses new async tasks during shutdown — write inline so
+            // we never drop the data.
+            writeSnapshot(snapshot);
+        }
+    }
+
+    /** Deep copy of the in-memory playtime map, safe to hand to an async task. */
+    private Map<UUID, Map<String, Long>> snapshotPlaytime() {
+        Map<UUID, Map<String, Long>> copy = new HashMap<>(playtime.size());
         for (Map.Entry<UUID, Map<String, Long>> e : playtime.entrySet()) {
+            copy.put(e.getKey(), new HashMap<>(e.getValue()));
+        }
+        return copy;
+    }
+
+    /** Serialize and write a playtime snapshot to disk. Thread-safe (no shared state). */
+    private void writeSnapshot(Map<UUID, Map<String, Long>> snapshot) {
+        if (playtimeFile == null) return;
+        FileConfiguration cfg = new YamlConfiguration();
+        for (Map.Entry<UUID, Map<String, Long>> e : snapshot.entrySet()) {
             for (Map.Entry<String, Long> w : e.getValue().entrySet()) {
                 cfg.set("players." + e.getKey() + "." + w.getKey(), w.getValue());
             }
@@ -401,7 +443,7 @@ public final class KawaiiScoreboard extends JavaPlugin implements Listener {
             b.title(title);
         }
         b.show();
-        refresh(p, b);
+        refresh(p, b, animatedTitle ? gradientTitle(titleText, titleFrame) : null);
     }
 
     private void detach(Player p) {
@@ -409,14 +451,16 @@ public final class KawaiiScoreboard extends JavaPlugin implements Listener {
         if (b != null) b.detach();
     }
 
-    private void refresh(Player p, PlayerBoard b) {
+    private void refresh(Player p, PlayerBoard b, Component frameTitle) {
         int onlineNow = Bukkit.getOnlinePlayers().size();
         int onlineMax = Bukkit.getMaxPlayers();
         Location loc = p.getLocation();
         String worldName = p.getWorld().getName();
         boolean bedrock = isBedrock(p);
 
-        if (animatedTitle) b.title(gradientTitle(titleText, titleFrame));
+        // frameTitle is the shared animated title for this cycle (null when the
+        // animation is off); PlayerBoard.title() no-ops if it's unchanged.
+        if (frameTitle != null) b.title(frameTitle);
 
         int row = 0;
         b.setRow(row++, label("Players: ").append(value(onlineNow + "§7/§f" + onlineMax)));

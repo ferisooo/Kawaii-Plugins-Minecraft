@@ -47,6 +47,11 @@ final class CamSession {
     private BukkitTask task;
     private Vector lastSubjectPos;
 
+    // FOLLOW: cached hostile count, refreshed on a throttle instead of every tick.
+    private static final int HOSTILE_REFRESH_TICKS = 20;
+    private int hostileCooldown;
+    private int cachedHostiles;
+
     private CamSession(KawaiiCam plugin, UUID operator, Mode mode, UUID targetId,
                        Location anchor, ShotDirector director, Recorder.Recording playback) {
         this.plugin = plugin;
@@ -122,7 +127,7 @@ final class CamSession {
 
         ShotDirector.Subject subject = new ShotDirector.Subject(
                 eye, target.getLocation().getYaw(), target.getEyeHeight(),
-                speed, countHostiles(target));
+                speed, hostiles(target));
 
         apply(op, world, director.tick(subject));
     }
@@ -167,6 +172,21 @@ final class CamSession {
         if (op == null) return;
         if (prevMode != null) op.setGameMode(prevMode);
         if (teleportBack && prevLoc != null) op.teleport(prevLoc);
+    }
+
+    /**
+     * Nearby hostile count, refreshed only every {@link #HOSTILE_REFRESH_TICKS}
+     * ticks. The director consumes this just when it cuts to a new shot (every
+     * few seconds), so a slightly stale count is harmless and avoids a costly
+     * entity scan on every tick.
+     */
+    private int hostiles(Player target) {
+        if (hostileCooldown <= 0) {
+            cachedHostiles = countHostiles(target);
+            hostileCooldown = HOSTILE_REFRESH_TICKS;
+        }
+        hostileCooldown--;
+        return cachedHostiles;
     }
 
     private static int countHostiles(Player target) {

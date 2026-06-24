@@ -68,11 +68,15 @@ public final class KawaiiHearts extends JavaPlugin implements Listener {
     private static final LegacyComponentSerializer SECTION =
             LegacyComponentSerializer.builder().character('\u00a7').hexColors().build();
 
+    /** Hard cap used when config requests an unlimited (<= 0) view radius. */
+    private static final double MAX_VIEW_RADIUS = 64.0;
+
     private enum Mode { ALWAYS, DAMAGED }
 
     private NamespacedKey managedKey;   // byte 1 once we've taken over the name
     private NamespacedKey origNameKey;  // original name as § string ("" = none)
     private NamespacedKey origVisKey;   // original custom-name-visible (byte)
+    private NamespacedKey renderKey;    // last-rendered bar (§ string) to skip redundant repaints
 
     // ---- config ----
     private boolean enabled;
@@ -83,7 +87,7 @@ public final class KawaiiHearts extends JavaPlugin implements Listener {
     private boolean   healthGradient;          // tint filled hearts by current HP %
     private TextColor gradHigh, gradMid, gradLow;
     private boolean preserveNames;
-    private double  viewRadius;     // <= 0 means "no proximity limit"
+    private double  viewRadius;     // <= 0 in config is clamped to MAX_VIEW_RADIUS
     private long    scanTicks;      // how often the proximity scan runs
     private final Set<EntityType> blacklist = EnumSet.noneOf(EntityType.class);
     private final Set<EntityType> onlyTypes = EnumSet.noneOf(EntityType.class);
@@ -99,6 +103,7 @@ public final class KawaiiHearts extends JavaPlugin implements Listener {
         managedKey  = new NamespacedKey(this, "managed");
         origNameKey = new NamespacedKey(this, "orig_name");
         origVisKey  = new NamespacedKey(this, "orig_vis");
+        renderKey   = new NamespacedKey(this, "render");
 
         saveDefaultConfig();
         loadConfigValues();
@@ -148,6 +153,11 @@ public final class KawaiiHearts extends JavaPlugin implements Listener {
         gradLow  = parseColor(cfg.getString("gradient-low",  "#ff5555"), NamedTextColor.RED);
         preserveNames = cfg.getBoolean("preserve-name-tags", true);
         viewRadius = cfg.getDouble("view-radius", 24.0);
+        // A non-positive radius once meant "unlimited" (scan every mob in every
+        // world) — unbounded and dangerous on busy servers. Clamp it to a sane
+        // maximum instead (the vanilla client only renders name tags ~64 blocks
+        // away anyway, so this is effectively the same visually).
+        if (viewRadius <= 0) viewRadius = MAX_VIEW_RADIUS;
         scanTicks  = Math.max(1L, cfg.getLong("scan-interval-ticks", 20L));
 
         blacklist.clear();
@@ -295,15 +305,7 @@ public final class KawaiiHearts extends JavaPlugin implements Listener {
     private Set<UUID> collectNearbyEligible() {
         Set<UUID> set = new HashSet<>();
 
-        if (viewRadius <= 0) { // no limit: every eligible loaded mob
-            for (var world : Bukkit.getWorlds()) {
-                for (LivingEntity le : world.getLivingEntities()) {
-                    if (eligible(le)) set.add(le.getUniqueId());
-                }
-            }
-            return set;
-        }
-
+        // viewRadius is always positive here (clamped in loadConfigValues).
         double r2 = viewRadius * viewRadius;
         for (Player p : Bukkit.getOnlinePlayers()) {
             for (Entity e : p.getNearbyEntities(viewRadius, viewRadius, viewRadius)) {
@@ -392,8 +394,19 @@ public final class KawaiiHearts extends JavaPlugin implements Listener {
             }
         }
 
+        // Skip re-setting the name (and its metadata packets) when the rendered
+        // bar is identical to what we last applied to this mob.
+        PersistentDataContainer pdc = le.getPersistentDataContainer();
+        String rendered = SECTION.serialize(out);
+        String lastRendered = pdc.get(renderKey, PersistentDataType.STRING);
+        if (lastRendered != null && lastRendered.equals(rendered)
+                && le.isCustomNameVisible()) {
+            return true;
+        }
+
         le.customName(out);
         le.setCustomNameVisible(true);
+        pdc.set(renderKey, PersistentDataType.STRING, rendered);
         return true;
     }
 
@@ -427,6 +440,7 @@ public final class KawaiiHearts extends JavaPlugin implements Listener {
         pdc.remove(managedKey);
         pdc.remove(origNameKey);
         pdc.remove(origVisKey);
+        pdc.remove(renderKey);
     }
 
     /** Max health without touching the renamed Attribute enum (varies by 1.21.x). */

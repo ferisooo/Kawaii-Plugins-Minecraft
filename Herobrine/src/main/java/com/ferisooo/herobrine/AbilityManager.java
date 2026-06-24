@@ -79,7 +79,7 @@ public final class AbilityManager {
                 ThreadLocalRandom.current().nextDouble(-2, 2));
         l.getWorld().strikeLightningEffect(strike);
         l.getWorld().playSound(l, Sound.ENTITY_LIGHTNING_BOLT_THUNDER, 1f, 1f);
-        if (l.distance(strike) < 4.0) {
+        if (l.distanceSquared(strike) < 4.0 * 4.0) {
             target.damage(cfg.lightningDamage());
         }
         for (Player p : nearby(l, 3.5)) {
@@ -188,25 +188,31 @@ public final class AbilityManager {
 
     private void alterNearbyBlocks(Location base) {
         // Snuff out nearby torches/light, mirroring the classic "lights go out" omen.
+        org.bukkit.World world = base.getWorld();
+        if (world == null) return;
+        int bx = base.getBlockX(), by = base.getBlockY(), bz = base.getBlockZ();
         int r = 6;
         for (int dx = -r; dx <= r; dx++) {
             for (int dy = -2; dy <= 2; dy++) {
                 for (int dz = -r; dz <= r; dz++) {
-                    Block b = base.clone().add(dx, dy, dz).getBlock();
+                    int x = bx + dx, y = by + dy, z = bz + dz;
+                    if (!world.isChunkLoaded(x >> 4, z >> 4)) continue; // never force-load
+                    Block b = world.getBlockAt(x, y, z);
                     if (b.getType() == Material.TORCH || b.getType() == Material.WALL_TORCH) {
                         placeTemp(b, Material.AIR); // snuffed out, then restored later
                     }
                 }
             }
         }
-        base.getWorld().playSound(base, Sound.BLOCK_FIRE_EXTINGUISH, 0.7f, 0.8f);
+        world.playSound(base, Sound.BLOCK_FIRE_EXTINGUISH, 0.7f, 0.8f);
     }
 
     private java.util.List<Player> nearby(Location l, double radius) {
         java.util.List<Player> out = new java.util.ArrayList<>();
+        double radiusSq = radius * radius;
         for (Player p : l.getWorld().getPlayers()) {
             if (p.getGameMode() == org.bukkit.GameMode.SPECTATOR) continue;
-            if (p.getLocation().distance(l) <= radius) out.add(p);
+            if (p.getLocation().distanceSquared(l) <= radiusSq) out.add(p);
         }
         return out;
     }

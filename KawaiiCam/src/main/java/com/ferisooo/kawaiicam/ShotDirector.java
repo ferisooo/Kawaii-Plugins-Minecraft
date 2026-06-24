@@ -60,6 +60,13 @@ final class ShotDirector {
 
     private Pose current; // smoothed, ready-to-apply pose
 
+    // Wall-avoidance raytrace is throttled: recompute every N ticks and reuse the
+    // last correction in between. The camera is heavily lerped, so a slightly
+    // stale wall-correction is invisible.
+    private static final int AVOID_INTERVAL = 3;
+    private int avoidCooldown;
+    private Vector cachedAvoid; // last corrected cam position (world-space)
+
     ShotDirector(Style style, double posSmoothing, double rotSmoothing,
                  boolean collision, int minTicks, int maxTicks) {
         this.style = style;
@@ -147,10 +154,25 @@ final class ShotDirector {
             }
         }
 
-        if (collision) cam = avoidWalls(s.eye, cam);
+        if (collision) cam = avoidWallsThrottled(s.eye, cam);
 
         double[] yp = CamMath.look(cam, lookAt);
         return Pose.of(cam, yp[0] + thirdsNudge, yp[1]);
+    }
+
+    /**
+     * Throttled wrapper around {@link #avoidWalls}: only fires the raytrace every
+     * {@link #AVOID_INTERVAL} ticks and reuses the last correction otherwise, so
+     * the lerp-smoothed motion stays essentially identical at a fraction of the
+     * raytrace cost.
+     */
+    private Vector avoidWallsThrottled(Location eye, Vector cam) {
+        if (avoidCooldown <= 0) {
+            cachedAvoid = avoidWalls(eye, cam);
+            avoidCooldown = AVOID_INTERVAL;
+        }
+        avoidCooldown--;
+        return cachedAvoid != null ? cachedAvoid.clone() : cam;
     }
 
     /** Pull the camera in if terrain sits between it and the subject. */

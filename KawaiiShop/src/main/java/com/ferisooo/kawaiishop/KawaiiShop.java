@@ -24,6 +24,8 @@ import org.bukkit.plugin.java.JavaPlugin;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.LinkedHashMap;
@@ -108,12 +110,18 @@ public final class KawaiiShop extends JavaPlugin implements Listener {
     private File moneyFile;
     private YamlConfiguration money;
     private final Map<UUID, Long> balances = new java.util.HashMap<>();
+    // Debounced async persistence: balance mutations mark this dirty; a periodic
+    // task snapshots money on the main thread and writes the bytes off-thread.
+    private volatile boolean moneyDirty = false;
+    private org.bukkit.scheduler.BukkitTask flushTask;
 
     @Override
     public void onEnable() {
         saveDefaultConfig();
         loadAll();
         getServer().getPluginManager().registerEvents(this, this);
+        // Debounced async flush of money.yml every 30s (600 ticks).
+        flushTask = Bukkit.getScheduler().runTaskTimer(this, this::flushMoneyAsync, 600L, 600L);
         getLogger().info("KawaiiShop enabled - " + categories.size() + " categories, "
                 + itemCount() + " items, skyblock-only.");
     }
@@ -126,7 +134,8 @@ public final class KawaiiShop extends JavaPlugin implements Listener {
 
     @Override
     public void onDisable() {
-        saveMoney();
+        if (flushTask != null) { flushTask.cancel(); flushTask = null; }
+        saveMoney(); // synchronous flush on shutdown so no balance is lost
     }
 
     private void loadAll() {
@@ -236,9 +245,31 @@ public final class KawaiiShop extends JavaPlugin implements Listener {
         if (m != null) cat.items.add(new Entry(m, buy, sell));
     }
 
+    /** Synchronous flush (used on disable). Writes the current balances to disk. */
     private void saveMoney() {
+        moneyDirty = false;
         try { money.save(moneyFile); }
         catch (IOException e) { getLogger().warning("Could not save money.yml: " + e.getMessage()); }
+    }
+
+    /**
+     * Periodic debounced flush. Runs on the main thread: if dirty, snapshot the
+     * config to a String here (YamlConfiguration is not thread-safe), then write
+     * the bytes off-thread so the main thread never blocks on disk I/O.
+     */
+    private void flushMoneyAsync() {
+        if (!moneyDirty) return;
+        moneyDirty = false;
+        final String data = money.saveToString();
+        final File file = moneyFile;
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                Files.write(file.toPath(), data.getBytes(StandardCharsets.UTF_8));
+            } catch (IOException e) {
+                moneyDirty = true; // retry on the next tick of the flush timer
+                getLogger().warning("Could not save money.yml: " + e.getMessage());
+            }
+        });
     }
 
     // ============================================================ economy
@@ -255,7 +286,7 @@ public final class KawaiiShop extends JavaPlugin implements Listener {
         if (v < 0) v = 0;
         balances.put(id, v);
         money.set(id.toString(), v);
-        saveMoney();
+        moneyDirty = true;
     }
 
     private void addBalance(UUID id, long delta) {

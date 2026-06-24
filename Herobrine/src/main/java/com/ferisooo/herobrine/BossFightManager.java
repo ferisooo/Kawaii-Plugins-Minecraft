@@ -113,14 +113,17 @@ public final class BossFightManager {
 
     private void refreshBar(Player target) {
         bar.setProgress(Math.max(0.0, Math.min(1.0, boss.getHealth() / boss.getMaxHealth())));
-        if (!bar.getPlayers().contains(target) && target.getLocation().distance(boss.getLocation()) < 64) {
+        if (!bar.getPlayers().contains(target)
+                && target.getLocation().distanceSquared(boss.getLocation()) < 64 * 64) {
             bar.addPlayer(target);
         }
     }
 
     private void runPhaseBehavior(Player target, int tick) {
         Location bl = boss.getLocation();
-        double dist = bl.getWorld() == target.getWorld() ? bl.distance(target.getLocation()) : 999;
+        // Squared distance avoids a per-tick sqrt; 999 sentinel stays huge when squared.
+        double distSq = bl.getWorld() == target.getWorld()
+                ? bl.distanceSquared(target.getLocation()) : 999 * 999;
         AbilityManager ab = plugin.abilities();
 
         // movement: always close in; phase 3 is faster (handled via more frequent moves)
@@ -128,7 +131,7 @@ public final class BossFightManager {
         boss.face(target.getEyeLocation());
 
         // melee when in reach (all phases)
-        if (dist < 3.0 && tick % 2 == 0) {
+        if (distSq < 3.0 * 3.0 && tick % 2 == 0) {
             boss.swing();
             target.damage(cfg.meleeDamage());
             target.playSound(target.getLocation(), Sound.ENTITY_PLAYER_ATTACK_STRONG, 1f, 0.7f);
@@ -136,7 +139,7 @@ public final class BossFightManager {
 
         // teleport: phase 1 occasionally, phase 3 frequently
         int tpEvery = phase >= 3 ? 6 : 14;
-        if (dist > 6 && tick % tpEvery == 0) {
+        if (distSq > 6 * 6 && tick % tpEvery == 0) {
             ab.shadowTeleport(boss, target);
         }
 
@@ -148,14 +151,19 @@ public final class BossFightManager {
 
         if (phase >= 3) {
             cleanupDeadMinions();
-            if (tick % 16 == 0 && minions.size() < cfg.minionCount()) {
+            if (tick % 16 == 0 && minions.size() < cappedMinionCount()) {
                 summonMinions(target);
             }
         }
     }
 
+    /** Hard upper bound on simultaneous minions, regardless of config, to cap per-minion particle tasks. */
+    private int cappedMinionCount() {
+        return Math.min(cfg.minionCount(), 8);
+    }
+
     private void summonMinions(Player target) {
-        int count = cfg.minionCount() - minions.size();
+        int count = cappedMinionCount() - minions.size();
         for (int i = 0; i < count; i++) {
             Location at = target.getLocation().add(
                     ThreadLocalRandom.current().nextDouble(-4, 4), 1,

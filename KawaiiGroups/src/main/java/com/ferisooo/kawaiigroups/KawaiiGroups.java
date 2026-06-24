@@ -33,6 +33,8 @@ import org.bukkit.plugin.java.JavaPlugin;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -75,6 +77,10 @@ public final class KawaiiGroups extends JavaPlugin implements Listener {
     // ---- persisted per-player settings ----
     private File settingsFile;
     private YamlConfiguration settings;
+    // Debounced async persistence: mutations mark this dirty; a periodic task
+    // snapshots settings on the main thread and writes the bytes off-thread.
+    private volatile boolean settingsDirty = false;
+    private org.bukkit.scheduler.BukkitTask flushTask;
 
     // ---- config ----
     private int baseHearts;
@@ -113,6 +119,8 @@ public final class KawaiiGroups extends JavaPlugin implements Listener {
         actionKey = new NamespacedKey(this, "action");
         loadSettings();
         getServer().getPluginManager().registerEvents(this, this);
+        // Debounced async flush of players.yml every 30s (600 ticks).
+        flushTask = Bukkit.getScheduler().runTaskTimer(this, this::flushSettingsAsync, 600L, 600L);
         getLogger().info("(✧) KawaiiGroups ready ~ groups, roles, invites & shared hearts!");
     }
 
@@ -126,7 +134,8 @@ public final class KawaiiGroups extends JavaPlugin implements Listener {
                 if (p != null) resetHearts(p);
             }
         }
-        saveSettings();
+        if (flushTask != null) { flushTask.cancel(); flushTask = null; }
+        saveSettings(); // synchronous flush on shutdown so nothing is lost
     }
 
     private void loadConfigValues() {
@@ -163,9 +172,31 @@ public final class KawaiiGroups extends JavaPlugin implements Listener {
         settings = YamlConfiguration.loadConfiguration(settingsFile);
     }
 
+    /** Synchronous flush (used on disable). Writes the current settings to disk. */
     private void saveSettings() {
+        settingsDirty = false;
         try { settings.save(settingsFile); }
         catch (IOException e) { getLogger().warning("Could not save players.yml: " + e.getMessage()); }
+    }
+
+    /**
+     * Periodic debounced flush. Runs on the main thread: if dirty, snapshot the
+     * config to a String here (YamlConfiguration is not thread-safe), then write
+     * the bytes off-thread so the main thread never blocks on disk I/O.
+     */
+    private void flushSettingsAsync() {
+        if (!settingsDirty) return;
+        settingsDirty = false;
+        final String data = settings.saveToString();
+        final File file = settingsFile;
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                Files.write(file.toPath(), data.getBytes(StandardCharsets.UTF_8));
+            } catch (IOException e) {
+                settingsDirty = true; // retry on the next tick of the flush timer
+                getLogger().warning("Could not save players.yml: " + e.getMessage());
+            }
+        });
     }
 
     private boolean setting(UUID u, String key, boolean def) {
@@ -173,10 +204,10 @@ public final class KawaiiGroups extends JavaPlugin implements Listener {
     }
     private void toggleSetting(UUID u, String key, boolean def) {
         settings.set(u + "." + key, !setting(u, key, def));
-        saveSettings();
+        settingsDirty = true;
     }
     private List<String> blocked(UUID u) { return settings.getStringList(u + ".blocked"); }
-    private void setBlocked(UUID u, List<String> v) { settings.set(u + ".blocked", v); saveSettings(); }
+    private void setBlocked(UUID u, List<String> v) { settings.set(u + ".blocked", v); settingsDirty = true; }
 
     // ============================================================ hearts
 

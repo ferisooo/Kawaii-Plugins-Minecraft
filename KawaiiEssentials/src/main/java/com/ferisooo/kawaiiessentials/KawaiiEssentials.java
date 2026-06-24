@@ -15,7 +15,9 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
+import org.bukkit.event.inventory.InventoryOpenEvent;
 import org.bukkit.event.player.AsyncPlayerChatEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.NamespacedKey;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
@@ -31,6 +33,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -59,6 +62,16 @@ public final class KawaiiEssentials extends JavaPlugin implements Listener {
     };
     private int guiFrame = 0;
 
+    // Cached shimmer border panes (constant once built) — one ItemStack per
+    // SHIMMER material, reused every animation frame instead of rebuilding ~20
+    // ItemStacks per open menu, per tick.
+    private ItemStack[] shimmerPanes;
+
+    // Players who currently have a KawaiiEssentials (MenuHolder) menu open.
+    // Maintained from InventoryOpenEvent/InventoryCloseEvent/PlayerQuitEvent so
+    // animateMenus only touches the handful of players actually viewing a menu.
+    private final Set<UUID> openMenuPlayers = new java.util.HashSet<>();
+
     // Default junk materials offered by the /trash filter GUI (overridable in config.yml).
     private static final List<String> DEFAULT_TRASH_FILTER_ITEMS = Collections.unmodifiableList(new ArrayList<>(java.util.Arrays.asList(
         "COBBLESTONE", "DIRT", "GRAVEL", "SAND", "COBBLED_DEEPSLATE",
@@ -72,6 +85,14 @@ public final class KawaiiEssentials extends JavaPlugin implements Listener {
     private YamlConfiguration data;    // hub, deaths, kit cooldowns
     private File warpsFile;
     private YamlConfiguration warps;   // keyed by owner UUID -> name + warps.<name> -> location
+
+    // ---- async save debounce ----
+    // Each store is marked dirty on mutation and flushed by a periodic task that
+    // serialises the YAML on the main thread, then writes the bytes off-thread.
+    // Avoids synchronous disk I/O on the main thread (notably on every death).
+    private volatile boolean homesDirty = false;
+    private volatile boolean dataDirty = false;
+    private volatile boolean warpsDirty = false;
 
     // Keys used to stash a warp owner / warp name on a GUI button so clicks
     // resolve unambiguously (instead of parsing display names).
@@ -108,17 +129,22 @@ public final class KawaiiEssentials extends JavaPlugin implements Listener {
         ownerKey = new NamespacedKey(this, "warp_owner");
         warpKey = new NamespacedKey(this, "warp_name");
         loadStores();
+        buildShimmerPanes();
         getServer().getPluginManager().registerEvents(this, this);
         // Shimmer-animate any open KawaiiEssentials menu every 4 ticks.
         Bukkit.getScheduler().runTaskTimer(this, this::animateMenus, 4L, 4L);
+        // Debounced disk flush: serialise on the main thread, write off-thread.
+        Bukkit.getScheduler().runTaskTimer(this, this::flushDirtyStores, 100L, 100L);
         getLogger().info("(✧) KawaiiEssentials ready ~ homes, tpa, hub, back, kit & trash!");
     }
 
     @Override
     public void onDisable() {
+        // Synchronous flush on shutdown so nothing dirty is lost.
         saveHomes();
         saveData();
         saveWarps();
+        homesDirty = dataDirty = warpsDirty = false;
     }
 
     // ============================================================
@@ -179,6 +205,43 @@ public final class KawaiiEssentials extends JavaPlugin implements Listener {
         } catch (IOException e) {
             getLogger().warning("Could not save data.yml: " + e.getMessage());
         }
+    }
+
+    // ---- dirty markers (called on the main thread in place of synchronous saves) ----
+    private void markHomesDirty() { homesDirty = true; }
+    private void markDataDirty()  { dataDirty = true; }
+    private void markWarpsDirty() { warpsDirty = true; }
+
+    /**
+     * Periodic debounced flush. Runs on the main thread: it serialises each
+     * dirty store to a String (YamlConfiguration access must stay on the main
+     * thread) and hands the bytes to an async task that writes them to disk.
+     */
+    private void flushDirtyStores() {
+        if (homesDirty) {
+            homesDirty = false;
+            writeAsync(homes.saveToString(), homesFile, "homes.yml");
+        }
+        if (dataDirty) {
+            dataDirty = false;
+            writeAsync(data.saveToString(), dataFile, "data.yml");
+        }
+        if (warpsDirty) {
+            warpsDirty = false;
+            writeAsync(warps.saveToString(), warpsFile, "warps.yml");
+        }
+    }
+
+    /** Write the already-serialised YAML text to {@code file} off the main thread. */
+    private void writeAsync(String yaml, File file, String label) {
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                java.nio.file.Files.write(file.toPath(),
+                        yaml.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            } catch (IOException e) {
+                getLogger().warning("Could not save " + label + ": " + e.getMessage());
+            }
+        });
     }
 
     /** Write a Location into a YAML section path. */
@@ -293,13 +356,17 @@ public final class KawaiiEssentials extends JavaPlugin implements Listener {
         }
     }
 
-    /** Safely teleport a player, loading the destination chunk first. */
+    /** Safely teleport a player, loading the destination chunk off the main thread first. */
     private void safeTeleport(Player player, Location dest) {
         World world = dest.getWorld();
-        world.getChunkAt(dest); // loads the chunk if needed
-        player.teleport(dest);
-        // version-safe sound: String overload only.
-        player.playSound(player.getLocation(), "minecraft:entity.enderman.teleport", 1f, 1f);
+        // Load the destination chunk asynchronously (no main-thread chunk gen).
+        // Paper runs this callback back on the main thread, where teleporting and
+        // playing the sound are safe.
+        world.getChunkAtAsync(dest).thenRun(() -> {
+            player.teleport(dest);
+            // version-safe sound: String overload only.
+            player.playSound(player.getLocation(), "minecraft:entity.enderman.teleport", 1f, 1f);
+        });
     }
 
     private void pickupSound(Player player) {
@@ -421,10 +488,22 @@ public final class KawaiiEssentials extends JavaPlugin implements Listener {
         return it;
     }
 
+    /** Build the (constant) shimmer border panes once, so each frame just reuses them. */
+    private void buildShimmerPanes() {
+        shimmerPanes = new ItemStack[SHIMMER.length];
+        for (int i = 0; i < SHIMMER.length; i++) {
+            shimmerPanes[i] = menuItem(SHIMMER[i], " ");
+        }
+    }
+
     /** Repaint the shimmer border of every open KawaiiEssentials menu, then refresh it. */
     private void animateMenus() {
+        // Nothing to animate if no one has an Essentials menu open.
+        if (openMenuPlayers.isEmpty()) return;
         guiFrame++;
-        for (Player p : Bukkit.getOnlinePlayers()) {
+        for (UUID id : openMenuPlayers) {
+            Player p = Bukkit.getPlayer(id);
+            if (p == null) continue;
             Inventory top = p.getOpenInventory().getTopInventory();
             if (top != null && top.getHolder() instanceof MenuHolder) {
                 paintBorder(top, guiFrame);
@@ -439,7 +518,8 @@ public final class KawaiiEssentials extends JavaPlugin implements Listener {
         for (int i = 0; i < size; i++) {
             boolean edge = i < 9 || i >= size - 9 || i % 9 == 0 || i % 9 == 8;
             if (edge) {
-                inv.setItem(i, menuItem(SHIMMER[Math.floorMod(i + frame, SHIMMER.length)], " "));
+                // Reuse the cached pane for this frame's colour instead of rebuilding it.
+                inv.setItem(i, shimmerPanes[Math.floorMod(i + frame, shimmerPanes.length)]);
             }
         }
     }
@@ -668,7 +748,7 @@ public final class KawaiiEssentials extends JavaPlugin implements Listener {
         String homeName = (args.length >= 1) ? args[0].toLowerCase() : "home";
         String path = player.getUniqueId() + ".homes." + homeName;
         writeLocation(homes, path, player.getLocation());
-        saveHomes();
+        markHomesDirty();
         msg(player, "&dHome &f" + homeName + " &dset! (✧)");
         pickupSound(player);
         return true;
@@ -705,7 +785,7 @@ public final class KawaiiEssentials extends JavaPlugin implements Listener {
             return true;
         }
         homes.set(path, null);
-        saveHomes();
+        markHomesDirty();
         msg(player, "&dDeleted home &f" + homeName + "&d.");
         return true;
     }
@@ -812,7 +892,7 @@ public final class KawaiiEssentials extends JavaPlugin implements Listener {
             return true;
         }
         writeLocation(data, "hub", player.getLocation());
-        saveData();
+        markDataDirty();
         msg(player, "&dHub set to your current location! (✧)");
         pickupSound(player);
         return true;
@@ -838,7 +918,7 @@ public final class KawaiiEssentials extends JavaPlugin implements Listener {
         String base = player.getUniqueId().toString();
         warps.set(base + ".name", player.getName()); // remember the owner's name for the GUI
         writeLocation(warps, base + ".warps." + warp, player.getLocation());
-        saveWarps();
+        markWarpsDirty();
         msg(player, "&dWarp &f" + warp + " &dset! Anyone can &f/warp " + warp + "&d. (✧)");
         pickupSound(player);
         return true;
@@ -862,7 +942,7 @@ public final class KawaiiEssentials extends JavaPlugin implements Listener {
         if (left == null || left.getKeys(false).isEmpty()) {
             warps.set(base, null);
         }
-        saveWarps();
+        markWarpsDirty();
         msg(player, "&dDeleted warp &f" + warp + "&d.");
         return true;
     }
@@ -1027,7 +1107,7 @@ public final class KawaiiEssentials extends JavaPlugin implements Listener {
         do { name = "warp" + n; n++; } while (warps.isConfigurationSection(base + ".warps." + name));
         warps.set(base + ".name", player.getName());
         writeLocation(warps, base + ".warps." + name, player.getLocation());
-        saveWarps();
+        markWarpsDirty();
         return name;
     }
 
@@ -1129,12 +1209,12 @@ public final class KawaiiEssentials extends JavaPlugin implements Listener {
             ConfigurationSection left = warps.getConfigurationSection(owner + ".warps");
             if (left == null || left.getKeys(false).isEmpty()) {
                 warps.set(owner, null);
-                saveWarps();
+                markWarpsDirty();
                 msg(player, "&dDeleted warp &f" + warp + "&d. That was your last one.");
                 openWarpsPlayers(player);
                 return;
             }
-            saveWarps();
+            markWarpsDirty();
             msg(player, "&dDeleted warp &f" + warp + "&d.");
             fillWarpsList(player, owner, event.getInventory());
             applyBedrock(player, event.getInventory());
@@ -1143,7 +1223,7 @@ public final class KawaiiEssentials extends JavaPlugin implements Listener {
         }
         if (own && event.isRightClick()) {                              // lock / unlock
             warps.set(path + ".locked", !locked);
-            saveWarps();
+            markWarpsDirty();
             msg(player, !locked
                     ? "&dWarp &f" + warp + " &dlocked &7(only you can use it)&d."
                     : "&dWarp &f" + warp + " &dunlocked &7(public)&d.");
@@ -1209,7 +1289,7 @@ public final class KawaiiEssentials extends JavaPlugin implements Listener {
             }
         }
         warps.set(oldPath, null);
-        saveWarps();
+        markWarpsDirty();
         msg(p, "&dRenamed &f" + oldName + " &d→ &f" + newName + "&d.");
         openWarpsList(p, base);
     }
@@ -1282,7 +1362,7 @@ public final class KawaiiEssentials extends JavaPlugin implements Listener {
             player.getInventory().addItem(new ItemStack(mat));
         }
         data.set(cdPath, now);
-        saveData();
+        markDataDirty();
         msg(player, "&dHere's your starter kit! Stay safe out there~ (✧)");
         pickupSound(player);
         return true;
@@ -1487,12 +1567,32 @@ public final class KawaiiEssentials extends JavaPlugin implements Listener {
     public void onDeath(PlayerDeathEvent event) {
         Player victim = event.getEntity();
         writeLocation(data, "deaths." + victim.getUniqueId(), victim.getLocation());
-        saveData();
+        markDataDirty();
+    }
+
+    /** Track players opening a KawaiiEssentials menu so animateMenus only iterates them. */
+    @EventHandler
+    public void onInventoryOpen(InventoryOpenEvent event) {
+        if (event.getInventory().getHolder() instanceof MenuHolder
+                && event.getPlayer() instanceof Player player) {
+            openMenuPlayers.add(player.getUniqueId());
+        }
+    }
+
+    /** Drop a player from the animated-menu set when they disconnect. */
+    @EventHandler
+    public void onPlayerQuit(PlayerQuitEvent event) {
+        openMenuPlayers.remove(event.getPlayer().getUniqueId());
     }
 
     @EventHandler
     public void onInventoryClose(InventoryCloseEvent event) {
         Inventory inv = event.getInventory();
+        // Stop animating this player's menu once it's closed. (Opening another
+        // MenuHolder fires InventoryOpenEvent, which re-adds them.)
+        if (inv.getHolder() instanceof MenuHolder && event.getPlayer() instanceof Player mp) {
+            openMenuPlayers.remove(mp.getUniqueId());
+        }
         if (!(inv.getHolder() instanceof TrashHolder)) {
             return;
         }

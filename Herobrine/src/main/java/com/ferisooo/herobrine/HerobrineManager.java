@@ -272,7 +272,8 @@ public final class HerobrineManager {
     public void resendIfNear(Player p) {
         if (!hasActive()) return;
         if (p.getWorld() != active.getLocation().getWorld()) return;
-        if (p.getLocation().distance(active.getLocation()) <= cfg.followRange()) {
+        double range = cfg.followRange();
+        if (p.getLocation().distanceSquared(active.getLocation()) <= range * range) {
             active.resendTo(p);
         }
     }

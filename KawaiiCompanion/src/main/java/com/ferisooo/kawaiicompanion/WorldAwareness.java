@@ -2,6 +2,7 @@ package com.ferisooo.kawaiicompanion;
 
 import org.bukkit.Location;
 import org.bukkit.Material;
+import org.bukkit.NamespacedKey;
 import org.bukkit.Tag;
 import org.bukkit.World;
 import org.bukkit.block.Biome;
@@ -94,16 +95,11 @@ public final class WorldAwareness {
         if (loc == null || loc.getWorld() == null) return "unknown";
         try {
             Biome b = loc.getBlock().getBiome();
-            // Try the modern Keyed API first (returns "minecraft:plains" → take "plains").
-            try {
-                Object key = b.getClass().getMethod("getKey").invoke(b);
-                if (key != null) {
-                    String full = key.toString();
-                    int slash = full.indexOf(':');
-                    return slash >= 0 ? full.substring(slash + 1) : full;
-                }
-            } catch (Throwable ignored) {
-                // Older API — fall through.
+            // Paper 1.21: Biome implements Keyed, so call getKey() directly
+            // (returns NamespacedKey "minecraft:plains" → take "plains").
+            NamespacedKey key = b.getKey();
+            if (key != null) {
+                return key.getKey();
             }
             return b.toString().toLowerCase();
         } catch (Throwable t) {

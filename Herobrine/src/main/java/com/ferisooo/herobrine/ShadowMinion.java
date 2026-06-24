@@ -67,7 +67,7 @@ public final class ShadowMinion {
                 l.getWorld().spawnParticle(Particle.LARGE_SMOKE, l, 2, 0.2, 0.3, 0.2, 0.0);
             }
         };
-        particleTask.runTaskTimer(plugin, 0L, 4L);
+        particleTask.runTaskTimer(plugin, 0L, 10L);
     }
 
     public boolean isAlive() { return entity != null && entity.isValid() && !entity.isDead(); }

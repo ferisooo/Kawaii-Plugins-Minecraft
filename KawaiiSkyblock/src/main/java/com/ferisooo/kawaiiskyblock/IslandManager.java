@@ -8,6 +8,8 @@ import org.bukkit.configuration.file.YamlConfiguration;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -96,6 +98,14 @@ public final class IslandManager {
     private final Map<UUID, Long> inviteExpiry = new HashMap<>();
     private static final long INVITE_TIMEOUT_MS = 120_000L;
 
+    /**
+     * Debounced-save state. Mutations mark {@code dirty} instead of writing the
+     * whole YAML file synchronously every time; a periodic flush (see
+     * {@link #flush()}) and {@link #saveNow()} on shutdown do the actual write.
+     * Only ever touched on the main thread.
+     */
+    private boolean dirty = false;
+
     public IslandManager(KawaiiSkyblock plugin, File dataFile) {
         this.plugin = plugin;
         this.dataFile = dataFile;
@@ -114,10 +124,42 @@ public final class IslandManager {
         rebuildWorldIndex();
     }
 
+    /**
+     * Debounced save: marks the data dirty instead of writing the whole YAML file
+     * synchronously on every mutation. The actual write happens via {@link #flush()}
+     * (periodic task) or {@link #saveNow()} (shutdown). Must be called on the main
+     * thread (where all {@code data} mutations occur).
+     */
     public void save() {
+        dirty = true;
+    }
+
+    /**
+     * If dirty, serialize the current data on the (main) calling thread and write
+     * it to disk off the main thread. Clears the dirty flag eagerly so concurrent
+     * mutations after the snapshot re-mark it for the next flush.
+     */
+    public void flush() {
+        if (!dirty) return;
+        dirty = false;
+        final String yaml = data.saveToString(); // snapshot on the main thread
+        Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> writeYaml(yaml));
+    }
+
+    /**
+     * Synchronous, blocking write of the current data. Used on shutdown so dirty
+     * data is always flushed before the server stops.
+     */
+    public void saveNow() {
+        dirty = false;
+        writeYaml(data.saveToString());
+    }
+
+    /** Writes the serialized YAML to {@link #dataFile} (creating the folder). */
+    private void writeYaml(String yaml) {
         try {
             if (!plugin.getDataFolder().exists()) plugin.getDataFolder().mkdirs();
-            data.save(dataFile);
+            Files.write(dataFile.toPath(), yaml.getBytes(StandardCharsets.UTF_8));
         } catch (IOException ex) {
             plugin.getLogger().warning("(✧) couldn't save islands.yml: " + ex.getMessage());
         }

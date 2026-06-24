@@ -20,6 +20,8 @@ import org.jetbrains.annotations.NotNull;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -74,6 +76,11 @@ public final class KawaiiQuests extends JavaPlugin implements TabCompleter {
     private final Map<UUID, Integer> abandonStacks = new HashMap<>();
     private final Map<UUID, Long> abandonLast = new HashMap<>();
 
+    /** Set when quest state changes; the periodic flush writes data.yml only when true. */
+    private volatile boolean dataDirty = false;
+    /** How often (ticks) the background flush checks the dirty flag and writes if needed. */
+    private static final long SAVE_INTERVAL_TICKS = 600L; // 30s
+
     // --------------------------------------------------------------- lifecycle
 
     @Override
@@ -90,12 +97,16 @@ public final class KawaiiQuests extends JavaPlugin implements TabCompleter {
         var cmd = getCommand("kquest");
         if (cmd != null) cmd.setTabCompleter(this);
         loadData();
+        // Debounced persistence: mutations flag data dirty; this timer snapshots on the
+        // main thread and writes bytes off-thread, instead of a sync write per mutation.
+        getServer().getScheduler().runTaskTimer(this, this::flushData,
+                SAVE_INTERVAL_TICKS, SAVE_INTERVAL_TICKS);
         getLogger().info("(✧) KawaiiQuests enabled ~ /kquest to begin! ✿");
     }
 
     @Override
     public void onDisable() {
-        saveData();                     // persist ongoing quests across restarts
+        flushDataSync();                // persist ongoing quests across restarts
         questManager.clearAll();
         if (antiExploit != null) antiExploit.clearPlaced();
     }
@@ -442,8 +453,17 @@ public final class KawaiiQuests extends JavaPlugin implements TabCompleter {
         if (loaded > 0) getLogger().info("(✧) restored " + loaded + " ongoing quest(s).");
     }
 
-    /** Persist all ongoing quests so they survive restarts/crashes. */
+    /**
+     * Flag the in-memory quest state as needing persistence. The actual write is
+     * deferred to the periodic {@link #flushData()} timer (or {@link #flushDataSync()}
+     * on disable), so per-mutation main-thread file writes are avoided.
+     */
     private void saveData() {
+        dataDirty = true;
+    }
+
+    /** Build the YAML view of all ongoing quests (must run on the main thread). */
+    private YamlConfiguration snapshotData() {
         YamlConfiguration y = new YamlConfiguration();
         for (Map.Entry<UUID, QuestManager.Active> e : questManager.all().entrySet()) {
             Quest q = e.getValue().quest;
@@ -460,12 +480,36 @@ public final class KawaiiQuests extends JavaPlugin implements TabCompleter {
                 y.set(base + ".reward-amount", q.getRewardAmount());
             }
         }
+        return y;
+    }
+
+    /** Write the given serialized YAML to data.yml. May run off the main thread. */
+    private void writeData(String yaml) {
         try {
-            if (!getDataFolder().exists()) getDataFolder().mkdirs();
-            y.save(new File(getDataFolder(), "data.yml"));
+            File folder = getDataFolder();
+            if (!folder.exists()) folder.mkdirs();
+            Files.write(new File(folder, "data.yml").toPath(),
+                    yaml.getBytes(StandardCharsets.UTF_8));
         } catch (IOException ex) {
             getLogger().warning("(✧) could not save quest data: " + ex.getMessage());
         }
+    }
+
+    /**
+     * Periodic flush: if dirty, snapshot on the main thread (safe), then write the
+     * bytes asynchronously so disk I/O never blocks the server tick.
+     */
+    private void flushData() {
+        if (!dataDirty) return;
+        dataDirty = false;
+        final String yaml = snapshotData().saveToString();
+        getServer().getScheduler().runTaskAsynchronously(this, () -> writeData(yaml));
+    }
+
+    /** Synchronous flush for shutdown: snapshot and write inline so no data is lost. */
+    private void flushDataSync() {
+        dataDirty = false;
+        writeData(snapshotData().saveToString());
     }
 
     /** Milliseconds left on a cooldown started at {@code last}, or 0 if none/expired. */

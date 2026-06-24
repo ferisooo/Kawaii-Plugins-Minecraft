@@ -5,6 +5,8 @@ import org.bukkit.configuration.file.YamlConfiguration;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -22,9 +24,24 @@ public final class ProgressManager {
     private final File file;
     private final Map<UUID, PlayerProgress> data = new HashMap<>();
 
+    /** Set on mutation; the periodic flush writes playerdata.yml only when true. */
+    private volatile boolean dirty = false;
+    /** How often (ticks) the background flush checks the dirty flag. */
+    private static final long SAVE_INTERVAL_TICKS = 600L; // 30s
+
     public ProgressManager(KawaiiDungeons plugin, File file) {
         this.plugin = plugin;
         this.file = file;
+    }
+
+    /**
+     * Start the debounced background flush. Mutations call {@link #save()} to flag
+     * the data dirty; this timer snapshots on the main thread and writes the bytes
+     * off-thread, replacing the old per-mutation synchronous main-thread write.
+     */
+    public void startAutoSave() {
+        plugin.getServer().getScheduler().runTaskTimer(plugin, this::flush,
+                SAVE_INTERVAL_TICKS, SAVE_INTERVAL_TICKS);
     }
 
     public PlayerProgress get(UUID id) {
@@ -66,7 +83,17 @@ public final class ProgressManager {
         plugin.getLogger().info("(✿) loaded progress for " + data.size() + " player(s).");
     }
 
+    /**
+     * Flag the in-memory progress as needing persistence. The actual write is deferred
+     * to the periodic {@link #flush()} timer (or {@link #saveSync()} on disable), so
+     * per-mutation main-thread file writes are avoided.
+     */
     public void save() {
+        dirty = true;
+    }
+
+    /** Build the YAML view of all player progress (must run on the main thread). */
+    private YamlConfiguration snapshot() {
         YamlConfiguration cfg = new YamlConfiguration();
         for (Map.Entry<UUID, PlayerProgress> e : data.entrySet()) {
             String base = "players." + e.getKey();
@@ -83,11 +110,35 @@ public final class ProgressManager {
                 cfg.set(base + ".speedrun-best." + sr.getKey(), sr.getValue());
             }
         }
+        return cfg;
+    }
+
+    /** Write the given serialized YAML to playerdata.yml. May run off the main thread. */
+    private void write(String yaml) {
         try {
-            cfg.save(file);
+            File parent = file.getParentFile();
+            if (parent != null && !parent.exists()) parent.mkdirs();
+            Files.write(file.toPath(), yaml.getBytes(StandardCharsets.UTF_8));
         } catch (IOException ex) {
             plugin.getLogger().warning("(✿) failed to save playerdata.yml: " + ex.getMessage());
         }
+    }
+
+    /**
+     * Periodic flush: if dirty, snapshot on the main thread (safe), then write the
+     * bytes asynchronously so disk I/O never blocks the server tick.
+     */
+    private void flush() {
+        if (!dirty) return;
+        dirty = false;
+        final String yaml = snapshot().saveToString();
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> write(yaml));
+    }
+
+    /** Synchronous flush for shutdown: snapshot and write inline so no data is lost. */
+    public void saveSync() {
+        dirty = false;
+        write(snapshot().saveToString());
     }
 
     /** Top players by best speedrun time for a given dungeon+difficulty key. */

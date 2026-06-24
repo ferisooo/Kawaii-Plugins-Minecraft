@@ -42,6 +42,15 @@ public final class KawaiiRecipes extends JavaPlugin implements Listener {
     private static final LegacyComponentSerializer LEGACY =
             LegacyComponentSerializer.legacyAmpersand();
 
+    /**
+     * Cached list of every keyed recipe registered on the server. Built once
+     * (lazily on first use) and reused for every player / join, instead of
+     * walking {@link Bukkit#recipeIterator()} per player. Invalidated on
+     * {@code /kr reload}. The set of server recipes only changes across a
+     * full server reload, so this is safe to cache for the plugin's lifetime.
+     */
+    private List<NamespacedKey> cachedRecipeKeys;
+
     private boolean enabled;
     private boolean unlockOnJoin;
     private long    joinDelayTicks;
@@ -91,6 +100,18 @@ public final class KawaiiRecipes extends JavaPlugin implements Listener {
      */
     private int unlockAll(Player p) {
         if (!enabled) return 0;
+        return p.discoverRecipes(recipeKeys());
+    }
+
+    /**
+     * Build (once) and return the cached list of all keyed recipe keys on the
+     * server. Walking {@link Bukkit#recipeIterator()} is comparatively costly,
+     * so we do it a single time and share the immutable result across every
+     * player and every join.
+     */
+    private List<NamespacedKey> recipeKeys() {
+        List<NamespacedKey> cached = cachedRecipeKeys;
+        if (cached != null) return cached;
         List<NamespacedKey> keys = new ArrayList<>();
         Iterator<Recipe> it = Bukkit.recipeIterator();
         while (it.hasNext()) {
@@ -101,7 +122,9 @@ public final class KawaiiRecipes extends JavaPlugin implements Listener {
             // anyway, so skipping them is fine.
             if (r instanceof Keyed k) keys.add(k.getKey());
         }
-        return p.discoverRecipes(keys);
+        cached = List.copyOf(keys);
+        cachedRecipeKeys = cached;
+        return cached;
     }
 
     @EventHandler
@@ -128,6 +151,7 @@ public final class KawaiiRecipes extends JavaPlugin implements Listener {
         if (args.length >= 1 && args[0].equalsIgnoreCase("reload")) {
             if (!sender.hasPermission("kawaiirecipes.admin")) return noPerm(sender);
             loadConfigValues();
+            cachedRecipeKeys = null; // rebuild on next unlock in case recipes changed
             sender.sendMessage(LEGACY.deserialize("&d(\u2727) KawaiiRecipes reloaded~"));
             return true;
         }

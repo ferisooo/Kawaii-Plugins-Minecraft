@@ -17,6 +17,7 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.event.inventory.InventoryCloseEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
@@ -27,7 +28,9 @@ import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * A bigger ender chest: 54 slots (two vanilla chests combined) per player.
@@ -51,6 +54,14 @@ public final class KawaiiEnderChest extends JavaPlugin implements Listener {
     private boolean importVanilla;
     private File dataDir;
 
+    /**
+     * In-memory cache of each online player's ender-chest contents, so the
+     * open/close hot path never touches disk on the main thread. Loaded lazily
+     * from disk on first open and evicted on quit. The stored array is the
+     * authoritative snapshot; values may be {@code null} for empty slots.
+     */
+    private final Map<UUID, ItemStack[]> cache = new ConcurrentHashMap<>();
+
     @Override
     public void onEnable() {
         saveDefaultConfig();
@@ -65,11 +76,16 @@ public final class KawaiiEnderChest extends JavaPlugin implements Listener {
 
     @Override
     public void onDisable() {
-        // Persist any big ender chests still open (e.g. on /stop).
+        // Persist any big ender chests still open (e.g. on /stop) into the cache,
+        // then flush everything synchronously since the server is shutting down.
         for (Player p : Bukkit.getOnlinePlayers()) {
             Inventory top = p.getOpenInventory().getTopInventory();
-            if (top.getHolder() instanceof EnderHolder h) save(h.owner, top);
+            if (top.getHolder() instanceof EnderHolder h) cache.put(h.owner, snapshot(top));
         }
+        for (Map.Entry<UUID, ItemStack[]> e : cache.entrySet()) {
+            writeToDisk(e.getKey(), e.getValue());
+        }
+        cache.clear();
     }
 
     private void readConfig() {
@@ -135,11 +151,22 @@ public final class KawaiiEnderChest extends JavaPlugin implements Listener {
     public void onClose(InventoryCloseEvent e) {
         Inventory inv = e.getInventory();
         if (inv.getHolder() instanceof EnderHolder h) {
-            save(h.owner, inv);
+            // Update the in-memory cache (main thread), then persist off-thread.
+            ItemStack[] snap = snapshot(inv);
+            cache.put(h.owner, snap);
+            saveAsync(h.owner, snap);
             if (e.getPlayer() instanceof Player p) {
                 p.playSound(p.getLocation(), Sound.BLOCK_ENDER_CHEST_CLOSE, 0.5f, 1.0f);
             }
         }
+    }
+
+    /** When a player leaves, flush their data off-thread and evict the cache. */
+    @EventHandler
+    public void onQuit(PlayerQuitEvent e) {
+        UUID id = e.getPlayer().getUniqueId();
+        ItemStack[] snap = cache.remove(id);
+        if (snap != null) saveAsync(id, snap);
     }
 
     // ============== open / load / save ==============
@@ -156,31 +183,66 @@ public final class KawaiiEnderChest extends JavaPlugin implements Listener {
     }
 
     private void load(Player p, Inventory inv) {
-        File f = fileFor(p.getUniqueId());
-        if (!f.exists()) {
-            // First open: bring across the vanilla 27-slot ender chest so the
-            // player doesn't "lose" their old items when we take over.
-            if (importVanilla) {
-                ItemStack[] vanilla = p.getEnderChest().getContents();
-                for (int i = 0; i < vanilla.length && i < inv.getSize(); i++) {
-                    if (vanilla[i] != null) inv.setItem(i, vanilla[i].clone());
-                }
-            }
-            return;
-        }
-        FileConfiguration cfg = YamlConfiguration.loadConfiguration(f);
-        List<?> list = cfg.getList("contents");
-        if (list == null) return;
-        for (int i = 0; i < list.size() && i < inv.getSize(); i++) {
-            Object o = list.get(i);
-            if (o instanceof ItemStack it) inv.setItem(i, it);
+        ItemStack[] contents = cache.computeIfAbsent(p.getUniqueId(), id -> loadFromDisk(p, id));
+        for (int i = 0; i < contents.length && i < inv.getSize(); i++) {
+            if (contents[i] != null) inv.setItem(i, contents[i].clone());
         }
     }
 
-    private void save(UUID id, Inventory inv) {
+    /**
+     * Reads a player's stored contents from disk (called at most once per
+     * session, on first open). Returns an array sized to {@link #slots}; empty
+     * slots are {@code null}.
+     */
+    private ItemStack[] loadFromDisk(Player p, UUID id) {
+        ItemStack[] contents = new ItemStack[slots];
+        File f = fileFor(id);
+        if (!f.exists()) {
+            // First open ever: bring across the vanilla 27-slot ender chest so the
+            // player doesn't "lose" their old items when we take over.
+            if (importVanilla) {
+                ItemStack[] vanilla = p.getEnderChest().getContents();
+                for (int i = 0; i < vanilla.length && i < contents.length; i++) {
+                    if (vanilla[i] != null) contents[i] = vanilla[i].clone();
+                }
+            }
+            return contents;
+        }
+        FileConfiguration cfg = YamlConfiguration.loadConfiguration(f);
+        List<?> list = cfg.getList("contents");
+        if (list == null) return contents;
+        for (int i = 0; i < list.size() && i < contents.length; i++) {
+            Object o = list.get(i);
+            if (o instanceof ItemStack it) contents[i] = it;
+        }
+        return contents;
+    }
+
+    /** Takes a detached, cloned snapshot of an inventory's contents. */
+    private ItemStack[] snapshot(Inventory inv) {
+        ItemStack[] src = inv.getContents();
+        ItemStack[] out = new ItemStack[src.length];
+        for (int i = 0; i < src.length; i++) {
+            out[i] = (src[i] == null) ? null : src[i].clone(); // nulls preserved as empty slots
+        }
+        return out;
+    }
+
+    /** Persists a snapshot off the main thread; the snapshot must be detached. */
+    private void saveAsync(UUID id, ItemStack[] snapshot) {
+        if (!isEnabled()) {
+            // During disable async tasks can't be scheduled; write inline.
+            writeToDisk(id, snapshot);
+            return;
+        }
+        getServer().getScheduler().runTaskAsynchronously(this, () -> writeToDisk(id, snapshot));
+    }
+
+    /** Serializes and writes a detached snapshot to disk. Thread-safe. */
+    private void writeToDisk(UUID id, ItemStack[] snapshot) {
         FileConfiguration cfg = new YamlConfiguration();
-        List<ItemStack> contents = new ArrayList<>(inv.getSize());
-        for (ItemStack it : inv.getContents()) contents.add(it); // nulls preserved as empty slots
+        List<ItemStack> contents = new ArrayList<>(snapshot.length);
+        for (ItemStack it : snapshot) contents.add(it); // nulls preserved as empty slots
         cfg.set("contents", contents);
         try {
             cfg.save(fileFor(id));

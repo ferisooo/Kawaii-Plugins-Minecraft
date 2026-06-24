@@ -79,6 +79,11 @@ public final class KawaiiWorlds extends JavaPlugin implements TabExecutor, Liste
     private String defaultSpawnWorld;
     private final Map<UUID, String> deathWorld = new ConcurrentHashMap<>();
 
+    // Cache of per-world spawn-protection radius, populated on enable/config-load
+    // and updated by cycleSpawnProtection. Avoids walking the YAML tree on every
+    // block break/place event. Absence of a key means radius <= 0 (no protection).
+    private final Map<String, Integer> spawnProtectionRadius = new ConcurrentHashMap<>();
+
     private static final class PendingCreate {
         final String type;
         final long createdMs;
@@ -90,6 +95,7 @@ public final class KawaiiWorlds extends JavaPlugin implements TabExecutor, Liste
         saveDefaultConfig();
         perWorldInventory = getConfig().getBoolean("per-world-inventory", true);
         defaultSpawnWorld = getConfig().getString("default-spawn-world", null);
+        reloadSpawnProtectionCache();
 
         PluginCommand cmd = getCommand("kawaiiworlds");
         if (cmd != null) {
@@ -1340,6 +1346,20 @@ public final class KawaiiWorlds extends JavaPlugin implements TabExecutor, Liste
         saveConfig();
     }
 
+    // Rebuild the spawn-protection radius cache from the current config.
+    // Only positive radii are stored; missing entries mean "no protection".
+    private void reloadSpawnProtectionCache() {
+        spawnProtectionRadius.clear();
+        ConfigurationSection sec = getConfig().getConfigurationSection("worlds");
+        if (sec == null) return;
+        for (String name : sec.getKeys(false)) {
+            ConfigurationSection w = sec.getConfigurationSection(name);
+            if (w == null) continue;
+            int r = w.getInt("spawn-protection", 0);
+            if (r > 0) spawnProtectionRadius.put(name, r);
+        }
+    }
+
     private void cycleSpawnProtection(World w) {
         String key = "worlds." + w.getName() + ".spawn-protection";
         int cur = getConfig().getInt(key, 0);
@@ -1352,6 +1372,9 @@ public final class KawaiiWorlds extends JavaPlugin implements TabExecutor, Liste
         if (next <= 0) getConfig().set(key, null);
         else getConfig().set(key, next);
         saveConfig();
+        // Keep the hot-path cache in sync with the new value.
+        if (next <= 0) spawnProtectionRadius.remove(w.getName());
+        else spawnProtectionRadius.put(w.getName(), next);
     }
 
     // NEW: lock toggle logic
@@ -1393,11 +1416,15 @@ public final class KawaiiWorlds extends JavaPlugin implements TabExecutor, Liste
     }
 
     private boolean isInProtectedSpawn(Location at, Player p) {
-        if (p.isOp() || p.hasPermission("kawaiiworlds.bypass-protection")) return false;
         World w = at.getWorld();
         if (w == null) return false;
-        int r = getConfig().getInt("worlds." + w.getName() + ".spawn-protection", 0);
+        // Cached radius lookup: absent / non-positive means no protection -> early out
+        // before touching permissions or the world spawn location.
+        Integer cached = spawnProtectionRadius.get(w.getName());
+        if (cached == null) return false;
+        int r = cached;
         if (r <= 0) return false;
+        if (p.isOp() || p.hasPermission("kawaiiworlds.bypass-protection")) return false;
         Location spawn = w.getSpawnLocation();
         double dx = at.getX() - spawn.getX();
         double dz = at.getZ() - spawn.getZ();
@@ -1701,6 +1728,9 @@ public final class KawaiiWorlds extends JavaPlugin implements TabExecutor, Liste
                 wc.environment(World.Environment.NORMAL);
                 break;
         }
+        // NOTE: createWorld() blocks the main thread while the world is generated.
+        // This stall is inherent to the Bukkit API — worlds must be created on the
+        // main thread and cannot be moved off it. Do not attempt to make this async.
         World w = wc.createWorld();
         if (w != null && ("void".equals(type) || "skyblock".equals(type))) {
             try {

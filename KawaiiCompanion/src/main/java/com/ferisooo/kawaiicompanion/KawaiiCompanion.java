@@ -653,6 +653,15 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
         UUID formTargetId;
         long nextFormTargetScanTick;
 
+        /** Cached priority-combat target + next tick we may re-scan. Same
+         *  throttle pattern as {@code formTargetId}: between scans the cached
+         *  threat is cheaply re-validated instead of re-running the full
+         *  getNearbyEntities priority sweep every behaviour tick. */
+        UUID priorityTargetId;
+        long nextPriorityScanTick;
+        /** Next tick the spotter chat-warning sweep is allowed to run. */
+        long nextSpotterScanTick;
+
         // ----- FEATURE 2: leveling & abilities -----
         /** Persisted companion level (1..max-level). */
         int level = 1;
@@ -2289,17 +2298,18 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
         // changes, chunk timing) within a minute. Marker-only — never
         // touches other plugins' mobs.
         if (tick % 600 == 0) {
+            org.bukkit.NamespacedKey markerKey = companionMarkerKey();
             for (World w : Bukkit.getWorlds()) {
                 for (Entity e : w.getEntities()) {
-                    if (isCompanionEntity(e.getUniqueId())) continue;
                     boolean marked = false;
                     try {
-                        marked = e.getPersistentDataContainer().has(companionMarkerKey(),
+                        marked = e.getPersistentDataContainer().has(markerKey,
                                 org.bukkit.persistence.PersistentDataType.STRING);
                     } catch (Throwable ignored) {}
-                    if (marked) {
-                        try { e.remove(); } catch (Throwable ignored) {}
-                    }
+                    if (!marked) continue;
+                    // Only an UNTRACKED marker-tagged mob is an orphan to clean.
+                    if (isCompanionEntity(e.getUniqueId())) continue;
+                    try { e.remove(); } catch (Throwable ignored) {}
                 }
             }
         }
@@ -2806,6 +2816,8 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
      *  so following looks smooth instead of stepping ½ block at the 10 Hz
      *  behaviour rate. */
     private void navMirrorTick() {
+        // Fast early-return: nothing to mirror when there are no companions at all.
+        if (companions.isEmpty() && extras.isEmpty()) return;
         for (Companion c : companions.values()) navMirrorOne(c);
         for (List<Companion> list : extras.values()) {
             for (Companion c : list) navMirrorOne(c);
@@ -5568,6 +5580,25 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
             c.assistTargetUntil = 0;
         }
 
+        // Throttle the expensive getNearbyEntities priority sweep: between
+        // scans keep fighting the cached threat as long as it's still alive,
+        // hostile, in range, visible and in the same world. Same ~10-tick
+        // cadence as the mob-form target cache (pickFormTarget). Only re-scan
+        // when the cache is empty/invalid or the throttle window elapsed.
+        if (c.priorityTargetId != null && tick < c.nextPriorityScanTick) {
+            Entity cached = Bukkit.getEntity(c.priorityTargetId);
+            if (cached instanceof LivingEntity le && !le.isDead()
+                    && le.getWorld() == origin.getWorld()
+                    && le.getLocation().distanceSquared(origin) <= scanRange * scanRange
+                    && isHostile(le)
+                    && !isCompanionEntity(le.getUniqueId())
+                    && (!combatRequireLineOfSight || companionCanSee(c, le))) {
+                return le;
+            }
+            c.priorityTargetId = null;
+        }
+        c.nextPriorityScanTick = tick + FORM_TARGET_SCAN_INTERVAL;
+
         // Collect all hostiles in range. Note: EnderDragon does NOT
         // implement Monster (it implements ComplexLivingEntity + Boss),
         // so we use a broader isHostile() check that includes it.
@@ -5592,17 +5623,19 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
             if (combatRequireLineOfSight && !companionCanSee(c, le)) continue;
             candidates.add(le);
         }
-        if (candidates.isEmpty()) return null;
+        if (candidates.isEmpty()) { c.priorityTargetId = null; return null; }
+
+        LivingEntity chosen = null;
 
         // 2. Boss — always preferred.
         if (bossModeEnabled) {
             for (LivingEntity e : candidates) {
-                if (isBoss(e)) return e;
+                if (isBoss(e)) { chosen = e; break; }
             }
         }
 
         // 3. Focus fire — pick mob currently targeting owner if any.
-        if (focusFireEnabled && owner != null) {
+        if (chosen == null && focusFireEnabled && owner != null) {
             LivingEntity targetingOwner = null;
             double bestDist = Double.MAX_VALUE;
             for (LivingEntity e : candidates) {
@@ -5612,17 +5645,19 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
                     if (d < bestDist) { bestDist = d; targetingOwner = m; }
                 }
             }
-            if (targetingOwner != null) return targetingOwner;
+            if (targetingOwner != null) chosen = targetingOwner;
         }
 
         // 4. Nearest fallback.
-        LivingEntity best = null;
-        double bestSq = Double.MAX_VALUE;
-        for (LivingEntity e : candidates) {
-            double d = e.getLocation().distanceSquared(origin);
-            if (d < bestSq) { bestSq = d; best = e; }
+        if (chosen == null) {
+            double bestSq = Double.MAX_VALUE;
+            for (LivingEntity e : candidates) {
+                double d = e.getLocation().distanceSquared(origin);
+                if (d < bestSq) { bestSq = d; chosen = e; }
+            }
         }
-        return best;
+        c.priorityTargetId = (chosen == null) ? null : chosen.getUniqueId();
+        return chosen;
     }
 
     /** True for the two endgame bosses. */
@@ -5690,6 +5725,12 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
      * wither/dragon/blaze.
      */
     private void runSpotterScan(Companion c, Location origin, long tick) {
+        // Throttle the per-tick getNearbyEntities sweep: spotter warnings are
+        // purely cosmetic chat bubbles gated by a much longer per-type cooldown,
+        // so scanning every behaviour tick is wasted work. Re-scan on the same
+        // ~10-tick cadence used by the form-target cache.
+        if (tick < c.nextSpotterScanTick) return;
+        c.nextSpotterScanTick = tick + FORM_TARGET_SCAN_INTERVAL;
         EntityType found = null;
         for (Entity e : origin.getWorld().getNearbyEntities(
                 origin, spotterRange, spotterRange, spotterRange)) {
@@ -7162,16 +7203,28 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
     private int removeStrayCompanionsOf(UUID owner, UUID keep) {
         int removed = 0;
         String want = owner.toString();
+        org.bukkit.NamespacedKey markerKey = companionMarkerKey();
         // Never delete the owner's OTHER live companions (helper mob-forms,
         // navigators) — only truly orphaned, owner-tagged mobs.
         java.util.Set<UUID> protectedIds = protectedCompanionIds(owner);
-        for (World w : Bukkit.getWorlds()) {
+        // Real-entity companions are non-persistent and respawned next to the
+        // owner, so owner-tagged orphans live in the owner's current world.
+        // Scan just that world (cheap) instead of every entity in every world;
+        // fall back to all worlds only when the owner isn't online to locate.
+        Iterable<World> worlds;
+        Player owp = Bukkit.getPlayer(owner);
+        if (owp != null && owp.isOnline() && owp.getWorld() != null) {
+            worlds = java.util.List.of(owp.getWorld());
+        } else {
+            worlds = Bukkit.getWorlds();
+        }
+        for (World w : worlds) {
             for (Entity e : w.getEntities()) {
                 if (keep != null && keep.equals(e.getUniqueId())) continue;
                 if (protectedIds.contains(e.getUniqueId())) continue;
                 String tag = null;
                 try {
-                    tag = e.getPersistentDataContainer().get(companionMarkerKey(),
+                    tag = e.getPersistentDataContainer().get(markerKey,
                             org.bukkit.persistence.PersistentDataType.STRING);
                 } catch (Throwable ignored) {}
                 if (!want.equals(tag)) continue;
@@ -7182,8 +7235,14 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
     }
 
     /** PDC marker on real-entity companions: owner UUID as a string. */
+    private org.bukkit.NamespacedKey companionMarkerKeyCache;
     private org.bukkit.NamespacedKey companionMarkerKey() {
-        return new org.bukkit.NamespacedKey(this, "companion-owner");
+        org.bukkit.NamespacedKey k = companionMarkerKeyCache;
+        if (k == null) {
+            k = new org.bukkit.NamespacedKey(this, "companion-owner");
+            companionMarkerKeyCache = k;
+        }
+        return k;
     }
 
     /** Lock-down + cosmetic traits applied to the real-entity companion. */
@@ -8473,6 +8532,8 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
 
     /** 20 Hz: steer every ridden companion from its owner's movement keys. */
     private void rideTick() {
+        // Fast early-return: nothing is being ridden when there are no companions.
+        if (companions.isEmpty()) return;
         for (Companion c : companions.values()) {
             if (!c.mounted || !c.realEntity) continue;
             Player owner = Bukkit.getPlayer(c.owner);

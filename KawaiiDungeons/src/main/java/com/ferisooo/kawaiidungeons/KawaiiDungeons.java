@@ -69,6 +69,7 @@ public final class KawaiiDungeons extends JavaPlugin implements Listener {
         lootManager.load();
         progressManager = new ProgressManager(this, new File(getDataFolder(), "playerdata.yml"));
         progressManager.load();
+        progressManager.startAutoSave();
         instanceManager = new InstanceManager(this, mobFactory, lootManager, progressManager);
 
         loadDungeons();
@@ -88,7 +89,7 @@ public final class KawaiiDungeons extends JavaPlugin implements Listener {
     @Override
     public void onDisable() {
         if (instanceManager != null) instanceManager.shutdownAll();
-        if (progressManager != null) progressManager.save();
+        if (progressManager != null) progressManager.saveSync();
     }
 
     private void saveResourceIfMissing(String name) {

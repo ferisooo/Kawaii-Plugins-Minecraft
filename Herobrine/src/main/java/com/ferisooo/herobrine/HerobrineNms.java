@@ -199,8 +199,9 @@ public final class HerobrineNms {
             applyPos(r, target);
             short dxs = (short) Math.round(dx * 4096.0), dys = (short) Math.round(dy * 4096.0), dzs = (short) Math.round(dz * 4096.0);
             byte yawB = (byte) ((int) (yaw * 256.0F / 360.0F)), pitchB = (byte) ((int) (pitch * 256.0F / 360.0F));
-            broadcastPacket(r, r.moveEntityPosRotCtor.newInstance(entityId, dxs, dys, dzs, yawB, pitchB, true));
-            broadcastPacket(r, r.rotateHeadCtor.newInstance(serverPlayer, yawB));
+            Object move = r.moveEntityPosRotCtor.newInstance(entityId, dxs, dys, dzs, yawB, pitchB, true);
+            Object head = r.rotateHeadCtor.newInstance(serverPlayer, yawB);
+            broadcastMovePackets(r, move, head);
             sentX += dxs / 4096.0; sentY += dys / 4096.0; sentZ += dzs / 4096.0;
         } catch (Throwable t) {
             plugin.getLogger().log(Level.WARNING, "[Herobrine] smoothMoveTo failed: " + t, t);
@@ -221,10 +222,11 @@ public final class HerobrineNms {
             r.entitySetXRot.invoke(serverPlayer, newPitch);
             r.entitySetYHeadRot.invoke(serverPlayer, newYaw);
             byte yawB = (byte) ((int) (newYaw * 256.0F / 360.0F)), pitchB = (byte) ((int) (newPitch * 256.0F / 360.0F));
-            if (r.moveEntityRotCtor != null) {
-                broadcastPacket(r, r.moveEntityRotCtor.newInstance(entityId, yawB, pitchB, true));
-            }
-            broadcastPacket(r, r.rotateHeadCtor.newInstance(serverPlayer, yawB));
+            Object rot = r.moveEntityRotCtor != null
+                    ? r.moveEntityRotCtor.newInstance(entityId, yawB, pitchB, true) : null;
+            Object head = r.rotateHeadCtor.newInstance(serverPlayer, yawB);
+            // Single culled viewer pass for both packets.
+            broadcastMovePackets(r, head, rot);
         } catch (Throwable t) {
             plugin.getLogger().log(Level.WARNING, "[Herobrine] lookAt failed: " + t, t);
         }
@@ -268,8 +270,31 @@ public final class HerobrineNms {
 
     // ============== internals ==============
 
+    /**
+     * Players past this distance from the NPC are not sent move/look packets:
+     * they cannot see him interpolate anyway, so the per-viewer reflection is
+     * wasted work. Matches the default follow/visible range (128 blocks). Spawn
+     * and despawn deliberately do NOT cull (see {@link #forEachViewer}) so a
+     * player who is rendered always gets the matching despawn.
+     */
+    private static final double VIEW_CULL_DISTANCE_SQ = 128.0 * 128.0;
+
     private void forEachViewer(Refs r, ViewerOp op) throws Throwable {
+        forEachViewer(r, op, false);
+    }
+
+    /**
+     * @param cull when {@code true}, skip viewers farther than
+     *             {@link #VIEW_CULL_DISTANCE_SQ} from the NPC. Only safe for
+     *             incremental move/look packets, never for spawn/despawn.
+     */
+    private void forEachViewer(Refs r, ViewerOp op, boolean cull) throws Throwable {
         for (Player viewer : world.getPlayers()) {
+            if (cull) {
+                Location vl = viewer.getLocation();
+                double dx = vl.getX() - x, dy = vl.getY() - y, dz = vl.getZ() - z;
+                if (dx * dx + dy * dy + dz * dz > VIEW_CULL_DISTANCE_SQ) continue;
+            }
             Object handle = r.craftPlayerGetHandle.invoke(viewer);
             if (HANDLES.contains(handle)) continue;
             Object conn = r.connectionField.get(handle);
@@ -347,6 +372,18 @@ public final class HerobrineNms {
 
     private void broadcastPacket(Refs r, Object packet) throws Throwable {
         forEachViewer(r, conn -> r.connectionSend.invoke(conn, packet));
+    }
+
+    /**
+     * Send several packets for the same movement in a SINGLE viewer pass (one
+     * reflection lookup per viewer instead of one pass per packet) and skip
+     * far-away players. Used by the 10 Hz move/look loops.
+     */
+    private void broadcastMovePackets(Refs r, Object p1, Object p2) throws Throwable {
+        forEachViewer(r, conn -> {
+            r.connectionSend.invoke(conn, p1);
+            if (p2 != null) r.connectionSend.invoke(conn, p2);
+        }, true);
     }
 
     private static Object unsafeAllocate(Class<?> cls) throws Throwable {

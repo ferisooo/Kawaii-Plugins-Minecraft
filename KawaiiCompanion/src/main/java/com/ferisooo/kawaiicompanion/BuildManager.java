@@ -49,6 +49,12 @@ public final class BuildManager {
     /** Allowed values for the delay-cycle button (in movement ticks). */
     private static final long[] DELAY_CYCLE = {1L, 2L, 5L, 10L, 20L, 40L};
 
+    /** Hard cap on how many linear schematic cells a single build tick may
+     *  advance, regardless of build mode. Keeps a giant FULL layer from
+     *  placing thousands of blocks (each firing a BlockPlaceEvent) in one
+     *  tick; the remainder resumes on the next tick. */
+    private static final int MAX_BLOCKS_PER_TICK = 256;
+
     private final KawaiiCompanion plugin;
     private final File schemFolder;
 
@@ -90,6 +96,34 @@ public final class BuildManager {
         /** Origin location the current preview was built at — used to
          *  detect when offset changes and we need to re-render. */
         Location previewOrigin;
+
+        /** Cached parse of {@link #selectedFile}. Schematic parsing is a
+         *  synchronous GZIP+NBT read off disk; the preview re-renders on
+         *  every GUI click, so without this each click re-parses the same
+         *  file. Invalidated when the path or file mtime changes. */
+        SchematicLoader.Schematic cachedSchematic;
+        File cachedSchematicFile;
+        long cachedSchematicMtime;
+    }
+
+    /**
+     * Load the schematic for {@code file}, reusing the session's cached parse
+     * when the same file (by path + last-modified time) was already parsed.
+     * Falls back to a fresh {@link SchematicLoader#load} on a cache miss and
+     * stores the result. Throws the same exceptions as the loader.
+     */
+    private SchematicLoader.Schematic loadCachedSchematic(Session s, File file) throws Exception {
+        long mtime = file.lastModified();
+        if (s.cachedSchematic != null
+                && file.equals(s.cachedSchematicFile)
+                && mtime == s.cachedSchematicMtime) {
+            return s.cachedSchematic;
+        }
+        SchematicLoader.Schematic sch = SchematicLoader.load(file);
+        s.cachedSchematic = sch;
+        s.cachedSchematicFile = file;
+        s.cachedSchematicMtime = mtime;
+        return sch;
     }
 
     private Session sessionFor(UUID id) {
@@ -120,7 +154,8 @@ public final class BuildManager {
         }
         SchematicLoader.Schematic sch;
         try {
-            sch = SchematicLoader.load(schemFile);
+            // Reuse the preview's cached parse for the same file when available.
+            sch = loadCachedSchematic(sessionFor(id), schemFile);
         } catch (Exception e) {
             owner.sendMessage("§c(✧) Failed to load " + schemFile.getName() + ": " + e.getMessage());
             plugin.getLogger().warning("(✧) Schematic load failed for " + schemFile.getName() + ": " + e);
@@ -409,6 +444,11 @@ public final class BuildManager {
         int total = rW * rH * rL;
         if (job.progress >= total) { job.complete = true; return; }
 
+        // Resolve the owner ONCE per tick (not once per placed block). Used to
+        // attribute each BlockPlaceEvent for land-protection plugins; may be
+        // null if the owner is offline (fail-open: blocks place unattributed).
+        Player owner = Bukkit.getPlayer(job.ownerId);
+
         // How many linear indices to process this step. Iteration order in
         // target space is Y outer → Z middle → X inner, so:
         //   BLOCK = 1
@@ -421,6 +461,13 @@ public final class BuildManager {
             case FULL  -> step = rW * rL;
             default    -> step = 1;
         }
+        // Per-tick budget cap: a FULL layer (or a very wide LINE) can be many
+        // thousands of cells, and placing them all in one tick — each firing a
+        // BlockPlaceEvent — spikes the main thread. Clamp the linear span we
+        // advance per tick so a giant layer is spread across ticks. The next
+        // tick simply resumes from job.progress, so the build still completes;
+        // it just no longer stalls the server on one tick.
+        if (step > MAX_BLOCKS_PER_TICK) step = MAX_BLOCKS_PER_TICK;
 
         // BLOCK mode special handling: most schematic cells are air, so a
         // straight 1-cell-per-step approach makes her freeze for many ticks
@@ -459,7 +506,7 @@ public final class BuildManager {
             plugin.teleportCompanionForBuild(job.ownerId, stand, placeLoc);
 
             int snapshotsBefore = job.snapshots.size();
-            placeOneBlock(job, w, x, y, z);
+            placeOneBlock(job, w, x, y, z, owner);
             job.progress = nextSolid + 1;
             if (job.progress >= total) job.complete = true;
 
@@ -478,7 +525,7 @@ public final class BuildManager {
             int rem = i - y * rW * rL;
             int z = rem / rW;
             int x = rem - z * rW;
-            placeOneBlock(job, w, x, y, z);
+            placeOneBlock(job, w, x, y, z, owner);
         }
         job.progress = end;
         if (job.progress >= total) job.complete = true;
@@ -521,7 +568,7 @@ public final class BuildManager {
      * job's rotation so directional blocks (stairs/doors/fences) face the
      * right way after the turn.
      */
-    private void placeOneBlock(BuildJob job, World w, int tx, int ty, int tz) {
+    private void placeOneBlock(BuildJob job, World w, int tx, int ty, int tz, Player owner) {
         BlockData bd = rotatedBlockAt(job.schematic, job.rotation, tx, ty, tz);
         if (bd == null) return;
         Material m = bd.getMaterial();
@@ -538,7 +585,7 @@ public final class BuildManager {
         // Place through a BlockPlaceEvent attributed to the owner so land
         // protection (WorldGuard, GriefPrevention, ...) can veto building on
         // claims it doesn't own. Vetoed blocks are skipped and NOT snapshotted.
-        Player owner = Bukkit.getPlayer(job.ownerId);
+        // {@code owner} is resolved once per tick by the caller, not per block.
         if (!placeRespectingProtection(block, original, bd, owner)) return;
         job.snapshots.add(new BuildJob.Snapshot(wx, wy, wz, original, bd));
     }
@@ -735,7 +782,7 @@ public final class BuildManager {
         if (s.selectedFile == null) return;
         SchematicLoader.Schematic sch;
         try {
-            sch = SchematicLoader.load(s.selectedFile);
+            sch = loadCachedSchematic(s, s.selectedFile);
         } catch (Exception e) {
             player.sendMessage("§c(✧) Couldn't preview " + s.selectedFile.getName() + ": " + e.getMessage());
             return;

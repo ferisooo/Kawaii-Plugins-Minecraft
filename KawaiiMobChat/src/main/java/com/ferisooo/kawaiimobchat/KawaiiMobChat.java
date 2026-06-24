@@ -23,7 +23,9 @@ import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
 import org.bukkit.scheduler.BukkitRunnable;
+import org.bukkit.util.Transformation;
 import org.bukkit.util.Vector;
+import org.joml.Vector3f;
 
 import java.io.File;
 import java.io.IOException;
@@ -755,9 +757,15 @@ public final class KawaiiMobChat extends JavaPlugin implements Listener {
                 .append(Component.text(spoken, textColor))
                 .build();
 
+        // Vertical offset above the mob's head. Applied as a display transformation
+        // translation so the bubble sits above the head while mounted as a passenger.
+        final float yOffset = (float) (mob.getHeight() + 0.4);
+
         final TextDisplay display;
         try {
-            Location spawnLoc = mob.getLocation().add(0, mob.getHeight() + 0.4, 0);
+            // Spawn at the mob's location; the passenger mount + translation handle
+            // positioning, so no per-tick teleport is needed.
+            Location spawnLoc = mob.getLocation();
             display = mob.getWorld().spawn(spawnLoc, TextDisplay.class, td -> {
                 td.text(text);
                 td.setBillboard(Display.Billboard.CENTER);
@@ -766,6 +774,15 @@ public final class KawaiiMobChat extends JavaPlugin implements Listener {
                 td.setPersistent(false);
                 try {
                     td.setAlignment(TextDisplay.TextAlignment.CENTER);
+                } catch (Throwable ignored) {}
+                // Lift the bubble above the mob's head once, at spawn.
+                try {
+                    Transformation tr = td.getTransformation();
+                    td.setTransformation(new Transformation(
+                            new Vector3f(0f, yOffset, 0f),
+                            tr.getLeftRotation(),
+                            tr.getScale(),
+                            tr.getRightRotation()));
                 } catch (Throwable ignored) {}
             });
         } catch (Throwable t) {
@@ -780,31 +797,47 @@ public final class KawaiiMobChat extends JavaPlugin implements Listener {
         // still see the TextDisplay above.
         sendBubbleToNearbyBedrock(mob, mobName, mood, spoken);
 
-        final UUID displayId = display.getUniqueId();
-        final UUID mobId = mob.getUniqueId();
+        // Mount the display as a passenger so it follows the mob automatically
+        // with no per-tick task. If mounting fails, fall back to a teleport
+        // follower so the bubble still tracks the mob.
+        boolean mounted = false;
+        try {
+            mounted = mob.addPassenger(display);
+        } catch (Throwable ignored) {}
+
         final long maxTicks = bubbleDurationSeconds * 20L;
 
-        new BukkitRunnable() {
-            long ticks = 0;
-            @Override
-            public void run() {
-                Entity disp = Bukkit.getEntity(displayId);
-                Entity host = Bukkit.getEntity(mobId);
-                if (!(disp instanceof TextDisplay) || ticks >= maxTicks) {
-                    if (disp != null) disp.remove();
-                    cancel();
-                    return;
+        if (mounted) {
+            // Single delayed task: remove the display after the bubble duration.
+            // Direct reference avoids a global UUID lookup.
+            final TextDisplay toRemove = display;
+            Bukkit.getScheduler().runTaskLater(this, () -> {
+                if (toRemove.isValid()) toRemove.remove();
+            }, maxTicks);
+        } else {
+            // Fallback: teleport follower. Hold direct references (no per-iteration
+            // Bukkit.getEntity lookups) and run at a coarser interval.
+            final TextDisplay disp = display;
+            final Mob host = mob;
+            new BukkitRunnable() {
+                long ticks = 0;
+                @Override
+                public void run() {
+                    if (!disp.isValid() || ticks >= maxTicks) {
+                        if (disp.isValid()) disp.remove();
+                        cancel();
+                        return;
+                    }
+                    if (host.isDead() || !host.isValid()) {
+                        disp.remove();
+                        cancel();
+                        return;
+                    }
+                    disp.teleport(host.getLocation().add(0, host.getHeight() + 0.4, 0));
+                    ticks += 5;
                 }
-                if (!(host instanceof LivingEntity) || host.isDead() || !host.isValid()) {
-                    disp.remove();
-                    cancel();
-                    return;
-                }
-                LivingEntity le = (LivingEntity) host;
-                disp.teleport(le.getLocation().add(0, le.getHeight() + 0.4, 0));
-                ticks += 2;
-            }
-        }.runTaskTimer(this, 0L, 2L);
+            }.runTaskTimer(this, 0L, 5L);
+        }
     }
 
     /**

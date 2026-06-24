@@ -38,6 +38,7 @@ import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -165,6 +166,11 @@ public final class KawaiiSparkles extends JavaPlugin implements Listener {
     private final Map<UUID, Boolean> hotbarOn = new HashMap<>();
     private final Map<UUID, Long> lastMoveTick = new HashMap<>();
 
+    /** Players who currently have a Sparkles control-panel menu open (for border repaint). */
+    private final Set<UUID> openMenus = new HashSet<>();
+    /** Cached border-pane ItemStacks, one per palette colour, built lazily. */
+    private ItemStack[] borderPaneCache;
+
     private long ticks;
     private BukkitTask animator;
 
@@ -240,6 +246,7 @@ public final class KawaiiSparkles extends JavaPlugin implements Listener {
             menuPalette.add(Material.MAGENTA_STAINED_GLASS_PANE);
             menuPalette.add(Material.PURPLE_STAINED_GLASS_PANE);
         }
+        borderPaneCache = null; // palette changed; rebuild lazily
 
         for (ActionType t : ActionType.values()) {
             loadAction(c, actions.computeIfAbsent(t, ActionData::new));
@@ -427,6 +434,11 @@ public final class KawaiiSparkles extends JavaPlugin implements Listener {
 
     @EventHandler
     public void onCloseSparkle(InventoryCloseEvent e) {
+        // Stop tracking a Sparkles control panel for the border repaint loop.
+        if (e.getInventory().getHolder() instanceof MenuHolder
+                && e.getPlayer() instanceof Player mp) {
+            openMenus.remove(mp.getUniqueId());
+        }
         if (!chestEnabled || chestCloseSound == null) return;
         if (!(e.getPlayer() instanceof Player p)) return;
         Location at = sparkleSpot(p, e.getInventory());
@@ -569,8 +581,10 @@ public final class KawaiiSparkles extends JavaPlugin implements Listener {
                     }
                 }
             }
-            if (menuEnabled && ticks % menuInterval == 0) {
-                for (Player p : Bukkit.getOnlinePlayers()) {
+            if (menuEnabled && !openMenus.isEmpty() && ticks % menuInterval == 0) {
+                for (UUID id : openMenus) {
+                    Player p = Bukkit.getPlayer(id);
+                    if (p == null) continue;
                     Inventory top = p.getOpenInventory().getTopInventory();
                     if (top.getHolder() instanceof MenuHolder) paintBorder(top);
                 }
@@ -590,6 +604,7 @@ public final class KawaiiSparkles extends JavaPlugin implements Listener {
         paintBorder(inv);
         placeButtons(inv, p, bedrock);
         p.openInventory(inv);
+        openMenus.add(p.getUniqueId());
         p.playSound(p.getLocation(), "block.amethyst_block.chime", 0.7f, 1.4f);
     }
 
@@ -741,17 +756,30 @@ public final class KawaiiSparkles extends JavaPlugin implements Listener {
         return SECTION.deserialize(s).decoration(TextDecoration.ITALIC, false);
     }
 
+    /** Builds (once) one blank-named pane ItemStack per palette colour. */
+    private ItemStack[] borderPanes() {
+        ItemStack[] cache = borderPaneCache;
+        if (cache != null && cache.length == menuPalette.size()) return cache;
+        cache = new ItemStack[menuPalette.size()];
+        for (int i = 0; i < cache.length; i++) {
+            ItemStack p = new ItemStack(menuPalette.get(i));
+            ItemMeta meta = p.getItemMeta();
+            if (meta != null) { meta.displayName(Component.text(" ")); p.setItemMeta(meta); }
+            cache[i] = p;
+        }
+        borderPaneCache = cache;
+        return cache;
+    }
+
     private void paintBorder(Inventory inv) {
         int size = inv.getSize();
         int rows = size / 9;
         long step = ticks / menuInterval;
+        ItemStack[] panes = borderPanes();
         for (int slot = 0; slot < size; slot++) {
             int row = slot / 9, col = slot % 9;
             if (!(row == 0 || row == rows - 1 || col == 0 || col == 8)) continue;
-            ItemStack p = new ItemStack(menuPalette.get((int) ((slot + step) % menuPalette.size())));
-            ItemMeta meta = p.getItemMeta();
-            if (meta != null) { meta.displayName(Component.text(" ")); p.setItemMeta(meta); }
-            inv.setItem(slot, p);
+            inv.setItem(slot, panes[(int) ((slot + step) % panes.length)]);
         }
     }
 
@@ -838,6 +866,12 @@ public final class KawaiiSparkles extends JavaPlugin implements Listener {
     public void onQuit(PlayerQuitEvent e) {
         UUID id = e.getPlayer().getUniqueId();
         lastMoveTick.remove(id);
+        footstepsOn.remove(id);
+        hotbarOn.remove(id);
+        openMenus.remove(id);
+        for (ActionData a : actions.values()) {
+            a.selected.remove(id);
+        }
     }
 
     private static final class MenuHolder implements InventoryHolder {

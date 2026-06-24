@@ -211,11 +211,16 @@ public final class HerobrinePlugin extends org.bukkit.plugin.java.JavaPlugin imp
 
     private void toggleNearbyDoor(Player p) {
         Location base = p.getLocation();
+        org.bukkit.World world = base.getWorld();
+        if (world == null) return;
+        int bx = base.getBlockX(), by = base.getBlockY(), bz = base.getBlockZ();
         int r = 6;
         for (int dx = -r; dx <= r; dx++) {
             for (int dy = -2; dy <= 2; dy++) {
                 for (int dz = -r; dz <= r; dz++) {
-                    Block b = base.clone().add(dx, dy, dz).getBlock();
+                    int x = bx + dx, y = by + dy, z = bz + dz;
+                    if (!world.isChunkLoaded(x >> 4, z >> 4)) continue; // never force-load
+                    Block b = world.getBlockAt(x, y, z);
                     if (b.getBlockData() instanceof Openable openable
                             && b.getType().name().contains("DOOR")) {
                         openable.setOpen(!openable.isOpen());
@@ -416,8 +421,9 @@ public final class HerobrinePlugin extends org.bukkit.plugin.java.JavaPlugin imp
 
     public void broadcastNearby(Location center, double radius, String msg) {
         if (msg == null || msg.isEmpty() || center.getWorld() == null) return;
+        double radiusSq = radius * radius;
         for (Player p : center.getWorld().getPlayers()) {
-            if (p.getLocation().distance(center) <= radius) p.sendMessage(cfg.prefix() + msg);
+            if (p.getLocation().distanceSquared(center) <= radiusSq) p.sendMessage(cfg.prefix() + msg);
         }
     }
 }

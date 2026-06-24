@@ -41,6 +41,11 @@ final class PlayerBoard {
     private final Team[] rowTeams;
     private final int rowCount;
 
+    /** Last Component pushed to each row, so we skip redundant prefix updates. */
+    private final Component[] lastRow;
+    /** Last title pushed to the objective, so we skip redundant displayName updates. */
+    private Component lastTitle;
+
     PlayerBoard(Player p, Component title, int rowCount) {
         if (rowCount < 1 || rowCount > MAX_ROWS) {
             throw new IllegalArgumentException("rowCount out of range: " + rowCount);
@@ -51,6 +56,8 @@ final class PlayerBoard {
         this.objective = board.registerNewObjective("kawaii_sb", Criteria.DUMMY, title);
         this.objective.setDisplaySlot(DisplaySlot.SIDEBAR);
         this.rowTeams = new Team[rowCount];
+        this.lastRow = new Component[rowCount];
+        this.lastTitle = title;
         for (int i = 0; i < rowCount; i++) {
             String entry = ENTRY_STUBS[i];
             Team t = board.registerNewTeam("ksb_row_" + i);
@@ -79,11 +86,17 @@ final class PlayerBoard {
     }
 
     void title(Component title) {
+        // Skip the displayName packet when the title hasn't changed since last push.
+        if (title != null && title.equals(lastTitle)) return;
+        lastTitle = title;
         objective.displayName(title);
     }
 
     void setRow(int i, Component text) {
         if (i < 0 || i >= rowCount) return;
+        // Row diffing: skip the prefix update packet when the row content is unchanged.
+        if (text != null && text.equals(lastRow[i])) return;
+        lastRow[i] = text;
         rowTeams[i].prefix(text);
     }
 
