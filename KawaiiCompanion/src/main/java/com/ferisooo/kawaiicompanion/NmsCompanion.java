@@ -385,14 +385,21 @@ public final class NmsCompanion {
             wrapper.sentY = wrapper.y;
             wrapper.sentZ = wrapper.z;
 
-            wrapper.broadcastSpawnPackets(r);
+            try {
+                wrapper.broadcastSpawnPackets(r);
 
-            // Splice into ServerLevel.players so mob target selectors find
-            // her. Doing this *after* the spawn packets (so viewers already
-            // have her rendered) keeps the visible state consistent if the
-            // splice fails halfway through.
-            if (worldIntegrated) {
-                wrapper.registerWithWorld(r);
+                // Splice into ServerLevel.players so mob target selectors find
+                // her. Doing this *after* the spawn packets (so viewers already
+                // have her rendered) keeps the visible state consistent if the
+                // splice fails halfway through.
+                if (worldIntegrated) {
+                    wrapper.registerWithWorld(r);
+                }
+            } catch (Throwable t) {
+                // Spawn failed after the handle was registered — drop it so
+                // the static skip-set doesn't pin the ServerPlayer forever.
+                COMPANION_HANDLES.remove(sp);
+                throw t;
             }
 
             return wrapper;

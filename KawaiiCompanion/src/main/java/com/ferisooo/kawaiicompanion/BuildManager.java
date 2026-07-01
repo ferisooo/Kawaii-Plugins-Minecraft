@@ -767,6 +767,11 @@ public final class BuildManager {
         s.previewedBlocks.clear();
         s.previewActive = false;
         s.previewOrigin = null;
+        // Drop the cached schematic parse too — it can hold tens of MB and
+        // there's no reason to keep it for an offline player. It's re-parsed
+        // (and re-cached) on the next use.
+        s.cachedSchematic = null;
+        s.cachedSchematicFile = null;
     }
 
     /** Soft cap on preview blocks. Above this we render an outline only. */

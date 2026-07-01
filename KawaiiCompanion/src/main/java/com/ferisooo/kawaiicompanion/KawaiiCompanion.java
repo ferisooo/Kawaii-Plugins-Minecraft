@@ -649,6 +649,10 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
         long nextPriorityScanTick;
         /** Next tick the spotter chat-warning sweep is allowed to run. */
         long nextSpotterScanTick;
+        /** Next tick the hunt-refill getNearbyEntities sweep may run. Same
+         *  throttle cadence as the other target caches — while a persistent
+         *  hunt is active the refill would otherwise sweep every tick. */
+        long nextHuntRefillTick;
 
         // ----- Persisted companion state -----
         /** Legacy persisted level/xp. Leveling was removed; these are kept only
@@ -750,6 +754,9 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
             for (Companion c : list) { try { despawnCompanion(c); } catch (Throwable ignored) {} }
         }
         extras.clear();
+        // Release the HttpClient's selector/worker threads so a plugin
+        // reload doesn't leak them (and pin this plugin's classloader).
+        try { http.shutdownNow(); } catch (Throwable ignored) {}
     }
 
     // ===== Exposed for BuildManager (schematic build / preview / revert) =====
@@ -1236,6 +1243,10 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
         // (c.entity == null), so requiring it would stop mob forms from ever
         // picking up hunt targets. We just scan around the owner.
         if (owner == null || c.huntFilter.isEmpty()) return;
+        // Throttle the getNearbyEntities sweep — a persistent hunt would
+        // otherwise pay O(nearby entities) every behaviour tick per companion.
+        if (behaviorTickCount < c.nextHuntRefillTick) return;
+        c.nextHuntRefillTick = behaviorTickCount + FORM_TARGET_SCAN_INTERVAL;
         boolean canPlayers = allowKillPlayers
                 && (owner.isOp() || owner.hasPermission("kawaiicompanion.kill.players"));
         for (Entity e : owner.getNearbyEntities(killRadius, killRadius, killRadius)) {
@@ -1623,7 +1634,11 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
     private void doReset(Player p) {
         Companion c = companions.get(p.getUniqueId());
         if (c != null) {
-            c.history.clear();
+            // Lock — an in-flight async DeepSeek call iterates history
+            // under this monitor; a bare clear() could race it.
+            synchronized (c.history) {
+                c.history.clear();
+            }
             saveMemory(c);
         } else {
             File f = memoryFile(p.getUniqueId());
@@ -1780,10 +1795,10 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
             }
             // Reject "no ground" — if there's nothing below to stand on
             // (e.g. owner on a peninsula edge looking out over a cliff)
-            // fall back to owner's spot.
+            // fall back to owner's spot. Water counts as ground (she can
+            // swim); lava does NOT — never teleport her over lava.
             if (belowOffset.isPassable()
-                    && belowOffset.getType() != Material.WATER
-                    && belowOffset.getType() != Material.LAVA) {
+                    && belowOffset.getType() != Material.WATER) {
                 return p.getLocation();
             }
         } catch (Throwable ignored) {
@@ -4457,7 +4472,10 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
      * ticks so a pile of items doesn't trigger 20 swings in a row.
      */
     private void tickPickup(Companion c, Player owner, long tick) {
-        if (c.entity == null || c.inventory == null) return;
+        if (c.entity == null) return;
+        // Lazily create her bag — without this, pickup silently does
+        // nothing until the player first opens the bag GUI.
+        ensureBag(c);
         if (tick - c.lastPickupScanTick < pickupScanInterval) return;
         c.lastPickupScanTick = tick;
 
@@ -4787,6 +4805,13 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
         huntPicks.remove(id);
         lastChatMillis.remove(id);
         bedrockNoticeShown.remove(id);
+        // GUI viewer trackers — the close event usually fires on disconnect,
+        // but don't rely on it; a missed entry would linger forever.
+        activeControlGuis.remove(id);
+        activeHuntGuis.remove(id);
+        activeDigGuis.remove(id);
+        skinsGuiViewers.remove(id);
+        skinsGuiPage.remove(id);
     }
 
     /**
@@ -6250,6 +6275,9 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
         Location loc = c.entity.getLocation();
         Entity hb = c.hitboxId == null ? null : Bukkit.getEntity(c.hitboxId);
         if (hb == null || !hb.isValid()) {
+            // Drop the stale map entry (the old entity is gone — e.g. chunk
+            // unload) so hitboxToOwner doesn't accumulate dead UUIDs.
+            if (c.hitboxId != null) hitboxToOwner.remove(c.hitboxId);
             spawnHitbox(c, loc);
         } else {
             // Bukkit's teleport on Interaction is cheap (no movement physics).
@@ -6704,6 +6732,11 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
         Player clicker = event.getPlayer();
         event.setCancelled(true);
 
+        // The event fires once per hand — cancel both so the click can't
+        // fall through to vanilla, but only act on the main-hand pass so
+        // the GUI (or the nudge message) doesn't fire twice per click.
+        if (event.getHand() != org.bukkit.inventory.EquipmentSlot.HAND) return;
+
         // Only the owner can boss her around. A friendly nudge for
         // anyone else.
         if (!clicker.getUniqueId().equals(ownerId)) {
@@ -6998,7 +7031,7 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
      * companion(s) for {@link #assistMemoryTicks} ticks. She'll chase
      * + attack that mob even if there are closer ones.
      */
-    @EventHandler
+    @EventHandler(ignoreCancelled = true)
     public void onPlayerDamaged(EntityDamageByEntityEvent event) {
         if (!(event.getEntity() instanceof Player victim)) return;
         Entity attacker = event.getDamager();
@@ -8128,10 +8161,15 @@ public final class KawaiiCompanion extends JavaPlugin implements Listener, TabCo
         skinsGuiPage.put(p.getUniqueId(), page);
 
         // Animate the shimmer border while the GUI is open. The task
-        // self-cancels once the player closes it (no longer a viewer).
+        // self-cancels once the player closes it (no longer a viewer) or
+        // flips to another page (a fresh task is scheduled per page —
+        // without the page check every page flip would stack one more
+        // repeating repaint task until the GUI finally closes).
         final UUID viewer = p.getUniqueId();
+        final int shownPage = page;
         Bukkit.getScheduler().runTaskTimer(this, task -> {
-            if (!skinsGuiViewers.containsKey(viewer)) { task.cancel(); return; }
+            if (!skinsGuiViewers.containsKey(viewer)
+                    || skinsGuiPage.getOrDefault(viewer, -1) != shownPage) { task.cancel(); return; }
             Player pl = Bukkit.getPlayer(viewer);
             if (pl == null || !pl.isOnline()) { task.cancel(); return; }
             Inventory top = pl.getOpenInventory().getTopInventory();
