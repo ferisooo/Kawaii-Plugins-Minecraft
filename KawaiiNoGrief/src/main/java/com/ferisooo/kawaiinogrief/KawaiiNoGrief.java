@@ -111,7 +111,15 @@ public final class KawaiiNoGrief extends JavaPlugin implements Listener {
     public void onBlockExplode(BlockExplodeEvent e) {
         if (!enabled) return;
         if (e.blockList().isEmpty()) return;
-        String key = e.getBlock().getType().getKey().getKey().toLowerCase(Locale.ROOT);
+        // getBlock() is usually AIR by the time this event fires (the exploding
+        // block was already removed) — the exploded block state keeps the
+        // original type (bed, respawn_anchor), so per-source overrides work.
+        String key;
+        try {
+            key = e.getExplodedBlockState().getType().getKey().getKey().toLowerCase(Locale.ROOT);
+        } catch (Throwable t) {
+            key = e.getBlock().getType().getKey().getKey().toLowerCase(Locale.ROOT);
+        }
         if (!allowBlockDamage(key)) {
             e.blockList().clear();
         }

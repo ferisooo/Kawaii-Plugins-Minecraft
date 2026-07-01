@@ -9,6 +9,7 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerCommandPreprocessEvent;
+import org.bukkit.event.player.PlayerCommandSendEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.util.HashSet;
@@ -95,6 +96,14 @@ public final class KawaiiNoCheat extends JavaPlugin implements Listener {
         }
     }
 
+    /** Hide blocked commands from tab-complete for players who can't run them. */
+    @EventHandler
+    public void onCommandSend(PlayerCommandSendEvent e) {
+        Player p = e.getPlayer();
+        if (!blockOps && p.hasPermission("kawaiinocheat.bypass")) return;
+        e.getCommands().removeIf(c -> c != null && blocked.contains(normalize(c)));
+    }
+
     /** Root command word of a raw "/cmd args" message, namespace-stripped + lowercased. */
     private static String commandRoot(String raw) {
         if (raw == null) return null;
@@ -136,6 +145,8 @@ public final class KawaiiNoCheat extends JavaPlugin implements Listener {
                 return true;
             }
             loadSettings();
+            // refresh client command trees so tab-complete matches the new list
+            for (Player p : getServer().getOnlinePlayers()) p.updateCommands();
             sender.sendMessage(ChatColor.LIGHT_PURPLE + "✿ KawaiiNoCheat reloaded ("
                     + blocked.size() + " blocked commands).");
             return true;

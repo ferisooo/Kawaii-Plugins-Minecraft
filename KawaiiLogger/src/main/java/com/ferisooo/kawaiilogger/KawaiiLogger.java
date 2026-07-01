@@ -3,7 +3,6 @@ package com.ferisooo.kawaiilogger;
 import io.papermc.paper.event.player.AsyncChatEvent;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
-import org.bukkit.Chunk;
 import org.bukkit.Location;
 import org.bukkit.NamespacedKey;
 import org.bukkit.Statistic;
@@ -18,6 +17,7 @@ import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Player;
 import org.bukkit.entity.Projectile;
 import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.enchantment.EnchantItemEvent;
@@ -77,6 +77,8 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
     private String botName;
     private long batchTicks = 160L;
     private HttpClient http;
+    /** When Discord answers 429, webhook sends are skipped until this epoch-ms. */
+    private volatile long webhookBackoffUntil = 0L;
 
     // ============== LOG STORAGE ==============
     private LogWriter logWriter;
@@ -325,7 +327,7 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
 
     // ============== DEATH (player) ==============
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onDeath(PlayerDeathEvent e) {
         Player victim = e.getEntity();
         Player killer = victim.getKiller();
@@ -345,7 +347,7 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
 
     // ============== ENTITY DEATH (mobs / bosses, killed by player) ==============
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onEntityDeath(EntityDeathEvent e) {
         LivingEntity victim = e.getEntity();
         if (victim instanceof Player) return; // PvP handled by PlayerDeathEvent
@@ -397,7 +399,7 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
 
     // ============== CHAT ==============
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onChat(AsyncChatEvent e) {
         Player p = e.getPlayer();
         String msg = PlainTextComponentSerializer.plainText().serialize(e.message());
@@ -406,7 +408,7 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
 
     // ============== DAMAGE ==============
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onAttacked(EntityDamageByEntityEvent e) {
         if (!(e.getEntity() instanceof Player)) return;
         Player p = (Player) e.getEntity();
@@ -432,7 +434,7 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
                 COLOR_DAMAGE);
     }
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onAnyDamage(EntityDamageEvent e) {
         if (e instanceof EntityDamageByEntityEvent) return;
         if (!(e.getEntity() instanceof Player)) return;
@@ -442,7 +444,7 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
 
     // ============== BLOCK BREAK (mining/logs/diamonds) ==============
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onBreak(BlockBreakEvent e) {
         Player p = e.getPlayer();
         Block b = e.getBlock();
@@ -475,7 +477,7 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
 
     // ============== CRAFT ==============
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onCraft(CraftItemEvent e) {
         if (!(e.getWhoClicked() instanceof Player)) return;
         Player p = (Player) e.getWhoClicked();
@@ -486,7 +488,7 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
 
     // ============== FISHING ==============
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onFish(PlayerFishEvent e) {
         if (e.getState() != PlayerFishEvent.State.CAUGHT_FISH) return;
         Entity caught = e.getCaught();
@@ -514,7 +516,7 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
 
     // ============== TAMING ==============
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onTame(EntityTameEvent e) {
         if (!(e.getOwner() instanceof Player)) return;
         Player p = (Player) e.getOwner();
@@ -527,7 +529,7 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
 
     // ============== BREEDING ==============
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onBreed(EntityBreedEvent e) {
         if (!(e.getBreeder() instanceof Player)) return;
         Player p = (Player) e.getBreeder();
@@ -537,7 +539,7 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
 
     // ============== SHEARING ==============
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onShear(PlayerShearEntityEvent e) {
         Player p = e.getPlayer();
         String type = e.getEntity().getType().name();
@@ -546,7 +548,7 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
 
     // ============== EAT / POTION ==============
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onConsume(PlayerItemConsumeEvent e) {
         Player p = e.getPlayer();
         ItemStack item = e.getItem();
@@ -577,7 +579,7 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
 
     // ============== ELYTRA ==============
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onGlide(EntityToggleGlideEvent e) {
         if (!e.isGliding()) return;
         if (!(e.getEntity() instanceof Player)) return;
@@ -593,7 +595,7 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
 
     // ============== ENCHANT ==============
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onEnchant(EnchantItemEvent e) {
         Player p = e.getEnchanter();
         if (p == null) return;
@@ -633,7 +635,7 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
 
     // ============== RARE DROPS (pickup) ==============
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onPickup(EntityPickupItemEvent e) {
         if (!(e.getEntity() instanceof Player)) return;
         Player p = (Player) e.getEntity();
@@ -656,7 +658,7 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
 
     // ============== TRADE ==============
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onTrade(InventoryClickEvent e) {
         if (!(e.getWhoClicked() instanceof Player)) return;
         Inventory inv = e.getInventory();
@@ -702,7 +704,7 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
 
     // ============== SLEEP ==============
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onSleep(PlayerBedEnterEvent e) {
         if (e.getBedEnterResult() != PlayerBedEnterEvent.BedEnterResult.OK) return;
         Player p = e.getPlayer();
@@ -713,7 +715,7 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
 
     // ============== MOVE (biome + structure) ==============
 
-    @EventHandler
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onMove(PlayerMoveEvent e) {
         Location from = e.getFrom();
         Location to = e.getTo();
@@ -729,11 +731,11 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
         // sprinting players (~4-5 calls/sec) and biomes very rarely change
         // within a 16x16 chunk, so this is a big saving for a tiny accuracy
         // tradeoff (intra-chunk biome transitions are missed until the next
-        // chunk cross).
-        Chunk fromChunk = from.getChunk();
-        Chunk toChunk = to.getChunk();
-        if (fromChunk == null || toChunk == null) return;
-        if (fromChunk.getX() == toChunk.getX() && fromChunk.getZ() == toChunk.getZ()) {
+        // chunk cross). Compare coordinates directly instead of Location.getChunk()
+        // — getChunk() can synchronously load the chunk (teleports also fire this
+        // event, and the from-chunk may already be unloaded).
+        if ((from.getBlockX() >> 4) == (to.getBlockX() >> 4)
+                && (from.getBlockZ() >> 4) == (to.getBlockZ() >> 4)) {
             return;
         }
 
@@ -767,12 +769,11 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
 
     private void checkStructure(Player p, Location loc) {
         World w = loc.getWorld();
-        Chunk c = loc.getChunk();
-        if (w == null || c == null) return;
+        if (w == null) return;
 
         String inStructure = null;
         try {
-            Collection<GeneratedStructure> structures = w.getStructures(c.getX(), c.getZ());
+            Collection<GeneratedStructure> structures = w.getStructures(loc.getBlockX() >> 4, loc.getBlockZ() >> 4);
             if (structures != null) {
                 for (GeneratedStructure gs : structures) {
                     BoundingBox bb = gs.getBoundingBox();
@@ -997,6 +998,8 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
         }
 
         if (webhookUrl == null || webhookUrl.isEmpty() || webhookUrl.contains("PASTE")) return;
+        // Discord rate-limited us — drop the webhook send (it's still in the file log).
+        if (System.currentTimeMillis() < webhookBackoffUntil) return;
 
         String json = "{"
                 + "\"username\":\"" + jsonEscape(botName) + "\","
@@ -1022,6 +1025,17 @@ public final class KawaiiLogger extends JavaPlugin implements Listener {
         }
 
         http.sendAsync(req, HttpResponse.BodyHandlers.discarding())
+                .thenAccept(resp -> {
+                    if (resp.statusCode() == 429) {
+                        long retryMs = 5_000L;
+                        try {
+                            String ra = resp.headers().firstValue("Retry-After").orElse(null);
+                            if (ra != null) retryMs = (long) (Double.parseDouble(ra) * 1000.0);
+                        } catch (NumberFormatException ignored) {}
+                        webhookBackoffUntil = System.currentTimeMillis() + retryMs;
+                        getLogger().warning("(\u2727) discord rate limited ~ pausing webhook sends for " + retryMs + "ms");
+                    }
+                })
                 .exceptionally(t -> {
                     getLogger().warning("(\u2727) webhook send failed: " + t.getMessage());
                     return null;
